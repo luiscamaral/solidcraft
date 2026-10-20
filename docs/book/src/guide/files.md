@@ -44,6 +44,23 @@ a temporary folder and opens it in the chosen slicer instead of asking for a fil
 list shows the slicers found on the computer with their icons; **Custom…** adds any other program
 to the top of the list (kept between runs; hover an entry you added and press Delete to remove it).
 
+Solids are triangulated for a mesh file at one of three levels of detail. Scripts, the CLI and
+MCP choose it with `detail` (or `tolerance` and `angle`) on `file.export` and `file.save_mesh`:
+
+| Detail | Largest distance from the surface | Most one facet turns | For |
+|---|---|---|---|
+| Coarse | 1/1000 of the body's size (at least 0.005 mm) | no limit | small files, previews, collision meshes |
+| Standard (default) | 1/5000 of the body's size (at least 0.001 mm) | no limit | the mesh earlier versions wrote |
+| Fine | 1/20000 of the body's size, at most 0.01 mm | 10° | 3D printing: small holes and rounds stay round on large parts |
+
+`tolerance` (mm, 0.0005–10) and `angle` (degrees, 1–45) set the two limits directly and take
+precedence over the detail. The command's reply lists the triangles written for each body. With
+`report: true`, it also gives each solid's volume as Measure gives it and the mesh's
+`volume_deviation` from it. Imported mesh bodies are written as they are. STEP, IGES and design
+files keep exact surfaces and refuse these options. On the command line:
+`solidcraft-cli run part.json --out part.3mf --mesh-detail fine` (or `--mesh-tolerance MM`,
+`--mesh-angle DEG`).
+
 Closed mechanical meshes with a constant cross-section can be rebuilt as solids with the
 `mesh.convert` command (command palette, scripts and the control channel).
 

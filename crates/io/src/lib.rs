@@ -18,6 +18,7 @@ pub use design::{
     write_design_container_with_thumbnail,
 };
 mod legacy_dir;
+mod mesh_options;
 #[cfg(test)]
 mod mutate;
 mod native_cad;
@@ -32,6 +33,7 @@ pub mod vfs;
 pub use dxf::{read_dxf, write_dxf};
 pub use dxf_out::{DxfEntity, DxfLayer, DxfLinetype, DxfShape, loop_shapes, seg_shape, write_dxf_drawing};
 pub use legacy_dir::{APP_ID, LEGACY_APP_ID, adopt_legacy_dir, legacy_flatpak_path};
+pub use mesh_options::{Exported, MAX_EXPORT_TRIANGLES, MESH_ANGLE_DEG, MESH_TOLERANCE_MM, MeshDetail, MeshInfo, MeshOptions};
 pub use safe_write::{backup_path, write_atomic};
 pub use sketch2d::{Geom2, MAX_DRAWING_BYTES};
 pub use svg::read_svg;
@@ -305,11 +307,50 @@ impl Format {
             _ => return Err(IoError::Format(ext)),
         })
     }
+
+    /// Is this a mesh format (whose detail [`MeshOptions`] choose)? STEP, IGES and designs
+    /// keep exact surfaces.
+    pub fn is_mesh(self) -> bool {
+        matches!(self, Format::StlBinary | Format::StlAscii | Format::Obj | Format::ThreeMf | Format::ThreeMfTagged | Format::Urdf)
+    }
 }
 
-/// Fine export mesh for a body (chord tolerance 2e-4 of its size).
+/// Fine export mesh for a body (chord tolerance 2e-4 of its size): [`MeshDetail::Standard`].
 pub fn export_mesh(b: &solidcraft_kernel::Body) -> Result<Mesh> {
-    Ok(b.tessellate((b.size() * 2e-4).max(1e-3))?)
+    export_mesh_with(b, &MeshOptions::default())
+}
+
+/// The mesh a file gets of a body at `options` ([`MeshOptions`]). A mesh body is its own mesh.
+pub fn export_mesh_with(b: &solidcraft_kernel::Body, options: &MeshOptions) -> Result<Mesh> {
+    let (tolerance, angle) = options.resolve(b.size());
+    Ok(b.tessellate_export(tolerance, angle)?)
+}
+
+/// The export meshes of `bodies`, in order, with the tolerance and angle each was meshed with
+/// (`None` for mesh bodies), refused once they pass `cap` triangles together.
+fn export_meshes(bodies: &[&solidcraft_doc::ModelBody], options: &MeshOptions, cap: usize) -> Result<Vec<(Mesh, Option<(f64, Option<f64>)>)>> {
+    let mut out = Vec::with_capacity(bodies.len());
+    let mut total = 0usize;
+    for b in bodies {
+        let m = export_mesh_with(&b.body, options)?;
+        total = total.saturating_add(m.triangles.len());
+        if total > cap {
+            return Err(IoError::Invalid(format!(
+                "the mesh would have more than {cap} triangles ({total} by body `{}`); use a larger tolerance or facet angle",
+                b.name
+            )));
+        }
+        let used = (!b.body.is_mesh()).then(|| options.resolve(b.body.size()));
+        out.push((m, used));
+    }
+    Ok(out)
+}
+
+/// What was written for a body: its triangles and their signed volume.
+fn mesh_info(body: &str, used: Option<(f64, Option<f64>)>, positions: &[Vec3], triangles: &[[u32; 3]]) -> MeshInfo {
+    let at = |i: u32| positions.get(i as usize).copied();
+    let v6: f64 = triangles.iter().filter_map(|t| Some(at(t[0])?.dot(at(t[1])?.cross(at(t[2])?)))).sum();
+    MeshInfo { body: body.to_string(), triangles: triangles.len(), tolerance: used.map(|u| u.0), angle: used.and_then(|u| u.1), volume: v6 / 6.0 }
 }
 
 /// Distance within which an exported mesh's vertices are welded (STL and 3MF alike).
@@ -415,26 +456,54 @@ fn threemf_metadata(meta: &Metadata) -> Vec<(&'static str, &str)> {
 /// STEP and IGES headers (author, organization; STEP also the description) and 3MF model
 /// metadata (project as the title, author as the designer, description, licence).
 pub fn export_with_metadata(state: &ModelState, bodies: &[String], format: Format, name: &str, meta: &Metadata) -> Result<Vec<u8>> {
+    Ok(export_with_options(state, bodies, format, name, meta, &MeshOptions::default())?.bytes)
+}
+
+/// [`export_with_metadata`], with mesh formats triangulated at `mesh` ([`MeshOptions`]; the
+/// default writes what [`export_with_metadata`] writes), and for them what was written per body.
+pub fn export_with_options(
+    state: &ModelState,
+    bodies: &[String],
+    format: Format,
+    name: &str,
+    meta: &Metadata,
+    mesh: &MeshOptions,
+) -> Result<Exported> {
+    export_capped(state, bodies, format, name, meta, mesh, MAX_EXPORT_TRIANGLES)
+}
+
+fn export_capped(
+    state: &ModelState,
+    bodies: &[String],
+    format: Format,
+    name: &str,
+    meta: &Metadata,
+    mesh: &MeshOptions,
+    cap: usize,
+) -> Result<Exported> {
     let sel: Vec<&solidcraft_doc::ModelBody> = state.bodies.iter().filter(|b| bodies.is_empty() || bodies.contains(&b.name)).collect();
     if sel.is_empty() {
         return Err(IoError::Empty);
     }
-    Ok(match format {
+    let mut infos = Vec::new();
+    let bytes = match format {
         Format::StlBinary | Format::StlAscii => {
             // Each body welded on its own (as for 3MF), so shared vertices are written identically
             // and the file is closed where faces meet.
-            let meshes: Vec<Mesh> = sel
-                .iter()
-                .map(|b| {
-                    let m = export_mesh(&b.body)?;
-                    let (positions, triangles) = weld(&m.positions, &m.triangles, weld_eps(&b.body));
-                    Ok(Mesh { positions, triangles, ..Mesh::default() })
-                })
-                .collect::<Result<_>>()?;
+            let mut meshes: Vec<Mesh> = Vec::with_capacity(sel.len());
+            for (b, (m, used)) in sel.iter().zip(export_meshes(&sel, mesh, cap)?) {
+                let (positions, triangles) = weld(&m.positions, &m.triangles, weld_eps(&b.body));
+                infos.push(mesh_info(&b.name, used, &positions, &triangles));
+                meshes.push(Mesh { positions, triangles, ..Mesh::default() });
+            }
             if format == Format::StlBinary { stl_binary(&meshes, name) } else { stl_ascii(&meshes, name).into_bytes() }
         }
         Format::Obj => {
-            let meshes: Vec<(String, Mesh)> = sel.iter().map(|b| Ok((b.name.clone(), export_mesh(&b.body)?))).collect::<Result<_>>()?;
+            let mut meshes: Vec<(String, Mesh)> = Vec::with_capacity(sel.len());
+            for (b, (m, used)) in sel.iter().zip(export_meshes(&sel, mesh, cap)?) {
+                infos.push(mesh_info(&b.name, used, &m.positions, &m.triangles));
+                meshes.push((b.name.clone(), m));
+            }
             obj(&meshes).into_bytes()
         }
         Format::Step => {
@@ -448,18 +517,23 @@ pub fn export_with_metadata(state: &ModelState, bodies: &[String], format: Forma
             solidcraft_kernel::iges_export_bodies(&bs, &step_header(format!("{name}.igs"), meta))?.into_bytes()
         }
         Format::ThreeMf | Format::ThreeMfTagged => {
-            let objs: Vec<MeshObject> = sel.iter().map(|b| mesh_object(b, format == Format::ThreeMfTagged)).collect::<Result<_>>()?;
+            let mut objs: Vec<MeshObject> = Vec::with_capacity(sel.len());
+            for (b, (m, used)) in sel.iter().zip(export_meshes(&sel, mesh, cap)?) {
+                let o = mesh_object(b, &m, format == Format::ThreeMfTagged)?;
+                infos.push(mesh_info(&b.name, used, &o.positions, &o.triangles));
+                objs.push(o);
+            }
             write_3mf_with(&objs, &threemf_metadata(meta))?
         }
         Format::Design => return Err(IoError::Format("solidcraft (save the document instead)".into())),
         Format::Urdf => return Err(IoError::Format("urdf (an assembly package; use file.export)".into())),
-    })
+    };
+    Ok(Exported { bytes, meshes: infos })
 }
 
-/// A body as a 3MF mesh: welded watertight (T-junctions split), coloured, and with `tagged`
-/// each triangle keeps the B-rep face it came from.
-fn mesh_object(b: &solidcraft_doc::ModelBody, tagged: bool) -> Result<MeshObject> {
-    let m = export_mesh(&b.body)?;
+/// A body as a 3MF mesh: its export mesh `m` welded watertight (T-junctions split), coloured,
+/// and with `tagged` each triangle keeps the B-rep face it came from.
+fn mesh_object(b: &solidcraft_doc::ModelBody, m: &Mesh, tagged: bool) -> Result<MeshObject> {
     let eps = weld_eps(&b.body);
     // Faces with colours of their own tag their triangles.
     let paint = b.body.paint();
@@ -629,6 +703,130 @@ mod tests {
         let mut m = Model::new();
         m.evaluate(&doc);
         (doc, m)
+    }
+
+    /// A Ø3 × 10 mm pin (curved faces) and a 20 mm cube, as a model state.
+    fn pin_and_cube() -> ModelState {
+        let pin = solidcraft_kernel::cylinder(Vec3::ZERO, Vec3::Z, 1.5, 10.0).unwrap();
+        let cube = solidcraft_kernel::box_solid(Vec3::new(10.0, 0.0, 0.0), Vec3::new(30.0, 20.0, 20.0)).unwrap();
+        let mut st = ModelState::default();
+        st.bodies.push(solidcraft_doc::ModelBody::new("Pin".into(), pin, 1));
+        st.bodies.push(solidcraft_doc::ModelBody::new("Cube".into(), cube, 2));
+        st
+    }
+
+    fn with(st: &ModelState, format: Format, mesh: MeshOptions) -> Exported {
+        export_with_options(st, &[], format, "t", &Metadata::default(), &mesh).unwrap()
+    }
+
+    /// No options write what the export wrote before them, byte for byte, in every mesh format.
+    #[test]
+    fn default_mesh_options_write_the_earlier_bytes() {
+        let st = pin_and_cube();
+        for format in [Format::StlBinary, Format::StlAscii, Format::Obj, Format::ThreeMf, Format::ThreeMfTagged] {
+            assert_eq!(with(&st, format, MeshOptions::default()).bytes, export(&st, &[], format, "t").unwrap(), "{format:?}");
+        }
+        // The earlier mesh itself: chord tolerance 2e-4 of the body's size, at least 1 µm.
+        for b in &st.bodies {
+            let earlier = b.body.tessellate((b.body.size() * 2e-4).max(1e-3)).unwrap();
+            let now = export_mesh(&b.body).unwrap();
+            assert_eq!(earlier.triangles, now.triangles);
+            let bits = |m: &Mesh| m.positions.iter().map(|p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]).collect::<Vec<_>>();
+            assert_eq!(bits(&earlier), bits(&now));
+        }
+        // The legacy STL writer path, rebuilt here, gives the same bytes.
+        let welded: Vec<Mesh> = st
+            .bodies
+            .iter()
+            .map(|b| {
+                let m = b.body.tessellate((b.body.size() * 2e-4).max(1e-3)).unwrap();
+                let (positions, triangles) = weld(&m.positions, &m.triangles, weld_eps(&b.body));
+                Mesh { positions, triangles, ..Mesh::default() }
+            })
+            .collect();
+        assert_eq!(with(&st, Format::StlBinary, MeshOptions::default()).bytes, stl_binary(&welded, "t"));
+    }
+
+    /// Finer detail: more triangles on curved faces and a volume closer to the exact one; planar
+    /// bodies are the same at every detail. The result says what each body was meshed with.
+    #[test]
+    fn detail_presets_order_triangles_and_volume_error() {
+        let st = pin_and_cube();
+        let exact_pin = std::f64::consts::PI * 1.5 * 1.5 * 10.0;
+        let run = |detail| with(&st, Format::StlBinary, MeshOptions { detail, ..MeshOptions::default() });
+        let (c, s, f) = (run(MeshDetail::Coarse), run(MeshDetail::Standard), run(MeshDetail::Fine));
+        let pin = |e: &Exported| e.meshes.iter().find(|m| m.body == "Pin").cloned().unwrap();
+        let cube = |e: &Exported| e.meshes.iter().find(|m| m.body == "Cube").cloned().unwrap();
+        assert!(pin(&c).triangles <= pin(&s).triangles && pin(&s).triangles < pin(&f).triangles, "{:?} {:?} {:?}", pin(&c), pin(&s), pin(&f));
+        let err = |e: &Exported| (exact_pin - pin(e).volume).abs();
+        assert!(err(&f) <= err(&s) && err(&s) <= err(&c), "{} {} {}", err(&c), err(&s), err(&f));
+        assert!(err(&f) / exact_pin < 1e-3, "{}", err(&f) / exact_pin);
+        assert_eq!(cube(&c).triangles, cube(&f).triangles);
+        assert!((cube(&f).volume - 8000.0).abs() < 1e-9);
+        assert_eq!(pin(&f).angle, Some(10f64.to_radians()));
+        assert!(pin(&f).tolerance.is_some_and(|t| t <= 0.01));
+        assert_eq!(pin(&s).angle, None);
+    }
+
+    /// Every preset writes a closed, consistently oriented mesh per body, and the same bytes again.
+    #[test]
+    fn every_detail_is_watertight_and_deterministic() {
+        let st = pin_and_cube();
+        for detail in [MeshDetail::Coarse, MeshDetail::Standard, MeshDetail::Fine] {
+            let o = MeshOptions { detail, ..MeshOptions::default() };
+            for format in [Format::StlBinary, Format::ThreeMf, Format::ThreeMfTagged, Format::Obj] {
+                assert_eq!(with(&st, format, o).bytes, with(&st, format, o).bytes, "{detail:?} {format:?}");
+            }
+            let f = mesh_import_feature(&with(&st, Format::ThreeMf, o).bytes, "t.3mf").unwrap();
+            let solidcraft_doc::FeatureKind::MeshImport { meshes, .. } = f.kind else { panic!() };
+            for m in &meshes {
+                // Every directed edge once, and its reverse once: closed and oriented.
+                let mut edges = std::collections::HashMap::new();
+                for t in m.triangles.chunks(3) {
+                    for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                        *edges.entry((a, b)).or_insert(0) += 1;
+                    }
+                }
+                assert!(edges.iter().all(|(&(a, b), &n)| n == 1 && edges.get(&(b, a)) == Some(&1)), "{detail:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn export_refuses_more_triangles_than_the_cap() {
+        let st = pin_and_cube();
+        let fine = MeshOptions { detail: MeshDetail::Fine, ..MeshOptions::default() };
+        let e = export_capped(&st, &[], Format::StlBinary, "t", &Metadata::default(), &fine, 50).unwrap_err();
+        assert!(e.to_string().contains("more than 50 triangles"), "{e}");
+        assert!(export_capped(&st, &[], Format::StlBinary, "t", &Metadata::default(), &fine, MAX_EXPORT_TRIANGLES).is_ok());
+    }
+
+    #[test]
+    fn mesh_bodies_are_written_as_they_are() {
+        let (_, m) = model();
+        let stl = export(&m.state(), &[], Format::StlBinary, "t").unwrap();
+        let f = mesh_import_feature(&stl, "box.stl").unwrap();
+        let mut d2 = Document::new("m");
+        d2.add_feature(f.kind, Some(&f.name)).unwrap();
+        let mut m2 = Model::new();
+        m2.evaluate(&d2);
+        let st = m2.state();
+        let fine = MeshOptions { detail: MeshDetail::Fine, tolerance: Some(0.0005), angle: Some(1f64.to_radians()) };
+        let e = with(&st, Format::StlBinary, fine);
+        assert_eq!(e.meshes[0].tolerance, None);
+        assert_eq!(e.bytes, with(&st, Format::StlBinary, MeshOptions::default()).bytes);
+    }
+
+    /// URDF link meshes follow the detail too.
+    #[test]
+    fn urdf_meshes_follow_the_detail() {
+        let st = pin_and_cube();
+        let doc = Document::new("t");
+        let size = |detail| {
+            let options = UrdfOptions { mesh: MeshOptions { detail, ..MeshOptions::default() }, ..UrdfOptions::default() };
+            urdf(&doc, &st, "t", &options).unwrap().meshes.iter().map(|(_, b)| b.len()).sum::<usize>()
+        };
+        assert!(size(MeshDetail::Coarse) < size(MeshDetail::Fine));
     }
 
     /// A binary STL of a cube's triangles.

@@ -15,7 +15,7 @@ use solidcraft_doc::joints::{self, Joint, JointKind};
 use solidcraft_doc::{Document, IDENTITY, MAX_PLACEMENT_DEPTH, MAX_PLACEMENTS, Mat, ModelState, Occurrence, apply_point, mat_inverse, mat_mul};
 use solidcraft_geom::{Mesh, Vec3};
 
-use crate::{IoError, Result, export_mesh, stl_binary, weld, weld_eps};
+use crate::{IoError, Result, export_mesh_with, stl_binary, weld, weld_eps};
 
 /// Mass (kg) and inertia (kg m²) of a link with no massive body: Gazebo drops massless links.
 const TOKEN_MASS: f64 = 1e-6;
@@ -33,6 +33,8 @@ pub struct UrdfOptions {
     /// `<limit effort>` (N or N m) and `velocity` (m/s or rad/s); defaults with a warning.
     pub effort: Option<f64>,
     pub velocity: Option<f64>,
+    /// How finely link meshes are triangulated (the default: what earlier versions wrote).
+    pub mesh: crate::MeshOptions,
 }
 
 /// The URDF, its mesh files (name next to the `.urdf`, bytes) and what was approximated.
@@ -215,7 +217,14 @@ struct Part {
 }
 
 /// Mesh files and masses per component (0: the root's bodies, named `base`).
-fn parts(doc: &Document, st: &ModelState, stem: &str, names: &mut Names, out: &mut UrdfPackage) -> Result<BTreeMap<u64, Part>> {
+fn parts(
+    doc: &Document,
+    st: &ModelState,
+    stem: &str,
+    mesh: &crate::MeshOptions,
+    names: &mut Names,
+    out: &mut UrdfPackage,
+) -> Result<BTreeMap<u64, Part>> {
     let mut used: BTreeSet<u64> = doc.occurrences.iter().map(|o| o.component).collect();
     used.insert(0);
     let mut parts = BTreeMap::new();
@@ -224,7 +233,7 @@ fn parts(doc: &Document, st: &ModelState, stem: &str, names: &mut Names, out: &m
         let (mut visual, mut collision) = (Mesh::default(), Mesh::default());
         let (mut masses, mut color, mut open) = (Vec::new(), None, false);
         for b in st.bodies.iter().filter(|b| doc.model_body_component(b) == c) {
-            let mut m = export_mesh(&b.body)?;
+            let mut m = export_mesh_with(&b.body, mesh)?;
             if let Some(o) = doc.model_body_offset(b) {
                 for p in &mut m.positions {
                     *p = apply_point(o, *p);
@@ -523,7 +532,7 @@ pub fn urdf(doc: &Document, st: &ModelState, stem: &str, options: &UrdfOptions) 
     let mut out = UrdfPackage { xml: String::new(), meshes: Vec::new(), model: UrdfModel::default(), warnings: Vec::new() };
     let base = names.take("base_link");
     let robot = sanitise(stem, false);
-    let parts = parts(doc, st, stem, &mut names, &mut out)?;
+    let parts = parts(doc, st, stem, &options.mesh, &mut names, &mut out)?;
     let mut tree = Tree {
         doc,
         parts,

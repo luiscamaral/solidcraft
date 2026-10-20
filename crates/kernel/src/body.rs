@@ -1088,6 +1088,17 @@ impl Body {
         self.tessellate_within(tol, f64::INFINITY, refine)
     }
 
+    /// Triangulate for a mesh file: chord tolerance `tol` (mm) and, with `angle`, no facet
+    /// turning more than `angle` radians across a curved face (at least 1°), so small radii stay
+    /// round on large bodies. Without `angle` this is [`Body::tessellate`] exactly. Neighbouring
+    /// faces share their edge points either way.
+    pub fn tessellate_export(&self, tol: f64, angle: Option<f64>) -> Result<Mesh> {
+        match angle.filter(|a| a.is_finite() && *a > 0.0) {
+            Some(a) => self.tessellate_within(tol, a, false),
+            None => self.tessellate(tol),
+        }
+    }
+
     /// [`Body::tessellate_with`] in which no facet turns more than `angle` radians either
     /// (infinite: the chord tolerance alone).
     fn tessellate_within(&self, tol: f64, angle: f64, refine: bool) -> Result<Mesh> {
@@ -1765,6 +1776,10 @@ impl Body {
 #[cfg(test)]
 #[path = "body_lump_tests.rs"]
 mod lump_tests;
+
+#[cfg(test)]
+#[path = "export_tess_tests.rs"]
+mod export_tess_tests;
 
 #[cfg(test)]
 #[path = "mesh_memo_tests.rs"]

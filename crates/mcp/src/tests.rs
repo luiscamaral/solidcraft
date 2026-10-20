@@ -140,6 +140,27 @@ fn export_tool_writes_a_urdf_package() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `export` passes the mesh detail through: Fine writes more triangles than Coarse, and
+/// file.export refuses a bad value.
+#[test]
+fn export_tool_takes_the_mesh_detail() {
+    let mut s = server();
+    tool(&mut s, "execute", json!({"command": "solid.cylinder", "params": {"radius": 5, "height": 10}}));
+    let dir = std::env::temp_dir().join(format!("solidcraft-mcp-detail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stl = dir.join("pin.stl").to_string_lossy().into_owned();
+    let coarse = tool(&mut s, "export", json!({"path": stl, "detail": "coarse"}));
+    let fine = tool(&mut s, "export", json!({"path": stl, "detail": "fine", "report": true}));
+    assert_eq!(fine["detail"], "fine", "{fine}");
+    assert!(fine["triangles"].as_u64().unwrap() > coarse["triangles"].as_u64().unwrap());
+    assert!(fine["meshes"][0]["volume_deviation"].is_number(), "{fine}");
+    let custom = tool(&mut s, "export", json!({"path": stl, "tolerance": 0.05, "angle": 20}));
+    assert_eq!(custom["meshes"][0]["tolerance"].as_f64(), Some(0.05));
+    let r = raw_tool(&mut s, "export", json!({"path": stl, "angle": 90}));
+    assert_eq!(r["result"]["isError"], json!(true), "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Box → fillet → hole in one batch, then verify with measure / inspect_design and look at it.
 #[test]
 fn agent_builds_box_fillet_hole() {

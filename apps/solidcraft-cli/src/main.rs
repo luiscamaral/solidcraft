@@ -1,7 +1,7 @@
 //! SolidCraft headless command line.
 //!
 //! ```text
-//! solidcraft-cli run <script.json|design.solidcraft|part.step|mesh.3mf> [--in design|part.step|mesh.3mf] [--out FILE]... [--save FILE] [--quiet] [--results] [--timings] [--profile] [--json-out FILE] [--allow-errors]
+//! solidcraft-cli run <script.json|design.solidcraft|part.step|mesh.3mf> [--in design|part.step|mesh.3mf] [--out FILE]... [--mesh-detail coarse|standard|fine] [--mesh-tolerance MM] [--mesh-angle DEG] [--save FILE] [--quiet] [--results] [--timings] [--profile] [--json-out FILE] [--allow-errors]
 //! solidcraft-cli eval <script.json|design.solidcraft|part.step> [--json-out FILE] (alias: inspect) measurements as JSON
 //! solidcraft-cli script <design.solidcraft> [--out script.json]     the design's history as a command script
 //! solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] [--display LEVEL [--edit NAME EXPR]] loading timings as JSON lines
@@ -42,6 +42,7 @@ const USAGE: &str = "usage:
   solidcraft-cli run <script.json|design.solidcraft|part.step> [--in design.solidcraft|part.step] [--out FILE]... [--save FILE] [--quiet] [--results] [--timings] [--profile] [--json-out FILE] [--allow-errors]
   solidcraft-cli run --in <design.solidcraft|part.step> [--out FILE]...
       (a timeline feature that fails fails the run and nothing is written; --allow-errors writes anyway)
+      (--mesh-detail, --mesh-tolerance MM, --mesh-angle DEG: how finely the mesh --out files (stl, obj, 3mf, urdf) are triangulated)
       (--timings prints {timings: [{index, command, ms}], total_ms} for a script, with --results its results too;
        --profile adds each command's profile: {boolean_ms, tessellate_ms, other_ms}, the kernel's share)
   solidcraft-cli eval <script.json|design.solidcraft|part.step> [--json-out FILE]     (alias: inspect; or --in FILE)
@@ -231,6 +232,27 @@ fn print_json(v: &Value, file: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// `--mesh-detail coarse|standard|fine`, `--mesh-tolerance MM` and `--mesh-angle DEGREES` as
+/// `file.export` parameters for the mesh files `--out` writes (file.export checks the values).
+fn mesh_flags(args: &[String]) -> Result<Value, String> {
+    let mut m = serde_json::Map::new();
+    if let Some(d) = flag(args, "--mesh-detail") {
+        m.insert("detail".into(), json!(d));
+    }
+    for (name, key) in [("--mesh-tolerance", "tolerance"), ("--mesh-angle", "angle")] {
+        if let Some(v) = flag(args, name) {
+            let x: f64 = v.parse().map_err(|_| format!("{name} needs a number, not `{v}`"))?;
+            m.insert(key.into(), json!(x));
+        }
+    }
+    for name in ["--mesh-detail", "--mesh-tolerance", "--mesh-angle"] {
+        if args.iter().any(|a| a == name) && flag(args, name).is_none_or(|v| v.starts_with("--")) {
+            return Err(format!("{name} needs a value"));
+        }
+    }
+    Ok(Value::Object(m))
+}
+
 fn cmd_run(args: &[String]) -> Result<(), String> {
     install_renderer();
     let json_out = json_out(args)?;
@@ -270,8 +292,20 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     if !args.iter().any(|a| a == "--allow-errors") {
         timeline_ok(&s)?;
     }
-    for out in flags(args, "--out") {
-        s.execute("file.export", &json!({"path": out})).map_err(|e| e.to_string())?;
+    let mesh = mesh_flags(args)?;
+    let outs = flags(args, "--out");
+    let is_mesh = |out: &str| solidcraft_engine::io::Format::from_name(out).is_ok_and(|f| f.is_mesh());
+    if mesh.as_object().is_some_and(|m| !m.is_empty()) && !outs.iter().any(|o| is_mesh(o)) {
+        return Err("--mesh-detail, --mesh-tolerance and --mesh-angle need a mesh --out (stl, obj, 3mf, urdf)".into());
+    }
+    for out in outs {
+        let mut p = json!({"path": out});
+        if is_mesh(out)
+            && let (Some(p), Some(m)) = (p.as_object_mut(), mesh.as_object())
+        {
+            p.extend(m.clone());
+        }
+        s.execute("file.export", &p).map_err(|e| e.to_string())?;
     }
     if let Some(p) = flag(args, "--save") {
         s.execute("file.save_as", &json!({"path": p})).map_err(|e| e.to_string())?;

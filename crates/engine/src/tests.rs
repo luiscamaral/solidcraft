@@ -314,6 +314,7 @@ mod large_step_import;
 mod loft_cut;
 mod loft_ring;
 mod loft_spacing;
+mod mesh_export_detail;
 mod mirror_placed;
 mod mirror_planes;
 #[cfg(not(target_arch = "wasm32"))]

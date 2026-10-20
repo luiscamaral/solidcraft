@@ -213,7 +213,9 @@ pub fn tool_definitions() -> Vec<Value> {
             "Export bodies to STEP (.step/.stp), 3MF (.3mf), binary STL (.stl), ASCII STL (format stla) or OBJ. The format \
              comes from the extension unless given. URDF (.urdf) exports the whole assembly for robot simulators: a link per \
              component placement with mass and inertia, joints from the assembly's joints, and STL meshes in metres written \
-             next to it (docs/urdf.md); RViz needs mesh_prefix such as package://robot/meshes/.",
+             next to it (docs/urdf.md); RViz needs mesh_prefix such as package://robot/meshes/. Mesh formats take detail \
+             (coarse, standard: the default, fine: at most 0.01 mm and 10 degrees per facet, for 3D printing), or tolerance \
+             (mm) and angle (degrees); the reply lists the triangles written per body.",
             obj(
                 json!({
                     "path": string("Output file"),
@@ -222,6 +224,10 @@ pub fn tool_definitions() -> Vec<Value> {
                     "mesh_prefix": string("urdf: put before each mesh file name (default: none, so relative to the .urdf)"),
                     "effort": {"type": "number", "description": "urdf: joint effort limit, N or N m (default 1000)"},
                     "velocity": {"type": "number", "description": "urdf: joint velocity limit, m/s or rad/s (default 10)"},
+                    "detail": {"type": "string", "enum": ["coarse", "standard", "fine"], "description": "Mesh formats: how finely solids are triangulated (default standard)"},
+                    "tolerance": {"type": "number", "description": "Mesh formats: largest distance from the surface, mm (0.0005..10; overrides detail)"},
+                    "angle": {"type": "number", "description": "Mesh formats: most one facet turns across a curved face, degrees (1..45; overrides detail)"},
+                    "report": {"type": "boolean", "description": "stl/obj/3mf: also measure each solid's volume and the mesh's volume_deviation (slower)"},
                 }),
                 &["path"],
             ),
@@ -427,7 +433,11 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<V
             p["expression"] = parameter_value(a)?;
             exec(b, "parameters.change", p)
         }
-        "export" => exec(b, "file.export", pick(a, &["path", "format", "bodies", "mesh_prefix", "effort", "velocity"])),
+        "export" => exec(
+            b,
+            "file.export",
+            pick(a, &["path", "format", "bodies", "mesh_prefix", "effort", "velocity", "detail", "tolerance", "angle", "report"]),
+        ),
         "crash_reports" => match a.get("id") {
             Some(_) => exec(b, "diagnostics.crash_report", pick(a, &["id"])),
             None => exec(b, "diagnostics.crash_reports", pick(a, &["limit"])),

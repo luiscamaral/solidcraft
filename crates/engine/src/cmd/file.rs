@@ -8,7 +8,7 @@ pub(crate) mod import;
 
 use serde_json::{Value, json};
 use solidcraft_doc::Document;
-use solidcraft_io::Format;
+use solidcraft_io::{Exported, Format, MESH_ANGLE_DEG, MESH_TOLERANCE_MM, MeshDetail, MeshInfo, MeshOptions};
 
 use super::CommandSpec;
 use crate::params::{bad, bool_, num, str_, string_list};
@@ -48,12 +48,12 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("file.export", "Export", export)
         .icon("export")
         .noundo()
-        .params("path; format?: stl|stla|obj|step|3mf|3mf-tagged|urdf|json (default from extension; 3mf-tagged: 3MF whose triangles carry their B-rep face, at full precision, for meshing and analysis tools; docs/formats/3mf-face-tags.md; urdf: the whole assembly as a robot, with STL meshes written next to it; docs/urdf.md); bodies?: [names] (JSON and URDF export the complete design); urdf only: mesh_prefix? (before each mesh file name, e.g. package://robot/meshes/), effort? (default 1000), velocity? (default 10)"),
+        .params("path; format?: stl|stla|obj|step|3mf|3mf-tagged|urdf|json (default from extension; 3mf-tagged: 3MF whose triangles carry their B-rep face, at full precision, for meshing and analysis tools; docs/formats/3mf-face-tags.md; urdf: the whole assembly as a robot, with STL meshes written next to it; docs/urdf.md); bodies?: [names] (JSON and URDF export the complete design); mesh formats only (stl, stla, obj, 3mf, 3mf-tagged, urdf): detail?: coarse|standard|fine (default standard: the mesh earlier versions wrote, 1/5000 of each body's size; fine: at most 0.01 mm and 10° per facet; coarse: 1/1000, no facet angle), tolerance? (mm, 0.0005..10: the largest distance from the surface), angle? (degrees, 1..45: the most one facet turns), report?: bool (also each solid's volume as inspect.measure gives it, solid_volume, within about 1e-4, and the mesh's volume_deviation from it) → triangles and meshes: [{body, triangles, tolerance, angle, volume}]; urdf only: mesh_prefix? (before each mesh file name, e.g. package://robot/meshes/), effort? (default 1000), velocity? (default 10)"),
     CommandSpec::new("file.save_mesh", "Save As Mesh", save_mesh)
         .at("MESH", "MODIFY")
         .icon("mesh_export")
         .noundo()
-        .params("path; format?: stl|3mf|3mf-tagged (default from the extension, else stl; 3mf-tagged: docs/formats/3mf-face-tags.md); bodies?: [names] (default: all); ascii?: bool (STL); slicer?: id, name or program path from file.slicers (open the saved file there)"),
+        .params("path; format?: stl|3mf|3mf-tagged (default from the extension, else stl; 3mf-tagged: docs/formats/3mf-face-tags.md); bodies?: [names] (default: all); ascii?: bool (STL); slicer?: id, name or program path from file.slicers (open the saved file there); detail?, tolerance?, angle?, report? (as file.export)"),
     CommandSpec::new("file.slicers", "Installed Slicers", slicers).icon("export")
         .noundo()
         .params("→ the slicers found on this machine: [{id, name, icon?}]; pass an id or name as file.save_mesh's `slicer`"),
@@ -465,23 +465,91 @@ fn save_as(s: &mut Session, p: &Value) -> Result<Value> {
     )
 }
 
-fn export_to(s: &Session, path: &str, format: Format, bodies: &[String]) -> Result<Value> {
+/// How a mesh export triangulates: `detail`, `tolerance` (mm) and `angle` (degrees), refused for
+/// formats that keep exact surfaces. None of them: the mesh earlier versions wrote.
+fn mesh_options(p: &Value, cmd: &str, format: Format) -> Result<MeshOptions> {
+    let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
+    if !["detail", "tolerance", "angle", "report"].iter().any(|k| given(k)) {
+        return Ok(MeshOptions::default());
+    }
+    if !format.is_mesh() {
+        return Err(bad(
+            cmd,
+            "detail, tolerance, angle and report apply to mesh formats (stl, obj, 3mf, urdf); step, iges and designs keep exact surfaces",
+        ));
+    }
+    let detail = match p.get("detail").filter(|v| !v.is_null()) {
+        None => MeshDetail::Standard,
+        Some(v) => v.as_str().and_then(MeshDetail::from_name).ok_or_else(|| bad(cmd, "detail must be coarse, standard or fine"))?,
+    };
+    let ranged = |k: &str, range: &std::ops::RangeInclusive<f64>, unit: &str| match p.get(k).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .filter(|x| x.is_finite() && range.contains(x))
+            .map(Some)
+            .ok_or_else(|| bad(cmd, format!("{k} must be a number from {} to {} {unit}", range.start(), range.end()))),
+    };
+    let tolerance = ranged("tolerance", &MESH_TOLERANCE_MM, "mm")?;
+    let angle = ranged("angle", &MESH_ANGLE_DEG, "degrees")?.map(f64::to_radians);
+    if given("report") && bool_(p, "report").is_none() {
+        return Err(bad(cmd, "report must be true or false"));
+    }
+    Ok(MeshOptions { detail, tolerance, angle })
+}
+
+fn export_to(s: &Session, path: &str, format: Format, bodies: &[String], p: &Value, cmd: &str) -> Result<Value> {
+    let mesh = mesh_options(p, cmd, format)?;
     let name = std::path::Path::new(path).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| s.doc.name.clone());
     // A design with components exports as a STEP assembly; otherwise bodies as placed.
-    let bytes = if format == Format::Design {
+    let mut state = None;
+    let exported = if format == Format::Design {
         if !bodies.is_empty() {
             return Err(bad("file.export", "design JSON exports the complete document; omit bodies"));
         }
-        solidcraft_io::write_design(&s.design())
+        Exported { bytes: solidcraft_io::write_design(&s.design()), meshes: Vec::new() }
     } else if format == Format::Step && bodies.is_empty() && !s.doc.occurrences.is_empty() {
-        solidcraft_io::step_assembly(&s.doc, &s.doc.painted(&s.model.state()), &name)?
+        Exported { bytes: solidcraft_io::step_assembly(&s.doc, &s.doc.painted(&s.model.state()), &name)?, meshes: Vec::new() }
     } else {
         // Bodies carry the colour they are shown in (appearance, material or imported), and the
         // file the design's properties where the format has a place for them.
-        solidcraft_io::export_with_metadata(&s.doc.painted(&s.world_state()), bodies, format, &name, &s.doc.metadata)?
+        let st = s.doc.painted(&s.world_state());
+        let out = solidcraft_io::export_with_options(&st, bodies, format, &name, &s.doc.metadata, &mesh)?;
+        state = Some(st);
+        out
     };
-    solidcraft_io::vfs::write(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    Ok(json!({"path": path, "bytes": bytes.len(), "format": format!("{format:?}")}))
+    solidcraft_io::vfs::write(path, &exported.bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let mut out = json!({"path": path, "bytes": exported.bytes.len(), "format": format!("{format:?}")});
+    if format.is_mesh() {
+        let report = bool_(p, "report").unwrap_or(false);
+        let meshes: Vec<Value> = exported.meshes.iter().map(|m| mesh_json(m, report.then_some(state.as_ref()).flatten())).collect();
+        out["detail"] = json!(mesh.detail.name());
+        out["triangles"] = json!(exported.meshes.iter().map(|m| m.triangles).sum::<usize>());
+        out["meshes"] = Value::Array(meshes);
+    }
+    Ok(out)
+}
+
+/// One body of a mesh export as the result reports it (tolerance in mm, angle in degrees); with
+/// `solids` (a `report: true` export), the solid's volume as Measure gives it (a refined fine
+/// tessellation, within about 1e-4) and the mesh's deviation from it.
+fn mesh_json(m: &MeshInfo, solids: Option<&solidcraft_doc::ModelState>) -> Value {
+    let mut v =
+        json!({"body": m.body, "triangles": m.triangles, "tolerance": m.tolerance, "angle": m.angle.map(f64::to_degrees), "volume": m.volume});
+    if let Some(st) = solids {
+        let solid = st.bodies.iter().find(|b| b.name == m.body).filter(|b| !b.body.is_mesh());
+        if let Some(b) = solid {
+            match solidcraft_kernel::measure_mass(&b.body) {
+                Ok(mm) if mm.volume.abs() > 0.0 => {
+                    v["solid_volume"] = json!(mm.volume);
+                    v["volume_deviation"] = json!((m.volume - mm.volume) / mm.volume);
+                }
+                Ok(_) => v["solid_volume"] = json!(0.0),
+                Err(e) => v["report_error"] = json!(e.to_string()),
+            }
+        }
+    }
+    v
 }
 
 fn export(s: &mut Session, p: &Value) -> Result<Value> {
@@ -490,7 +558,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     if format == Format::Urdf {
         return export_urdf(s, path, p);
     }
-    export_to(s, path, format, &string_list(p, "bodies"))
+    export_to(s, path, format, &string_list(p, "bodies"), p, "file.export")
 }
 
 /// The assembly as a URDF and its meshes next to it (docs/urdf.md). Every path is checked before
@@ -506,7 +574,11 @@ fn export_urdf(s: &Session, path: &str, p: &Value) -> Result<Value> {
     };
     // `io::urdf` refuses a prefix XML cannot hold.
     let mesh_prefix = str_(p, "mesh_prefix").unwrap_or("").to_string();
-    let options = solidcraft_io::UrdfOptions { mesh_prefix, effort: positive("effort")?, velocity: positive("velocity")? };
+    if p.get("report").is_some_and(|v| !v.is_null()) {
+        return Err(bad(cmd, "report applies to stl, obj and 3mf exports; urdf reports its links and joints"));
+    }
+    let mesh = mesh_options(p, cmd, Format::Urdf)?;
+    let options = solidcraft_io::UrdfOptions { mesh_prefix, effort: positive("effort")?, velocity: positive("velocity")?, mesh };
     let file = std::path::Path::new(path);
     let stem = file.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| s.doc.name.clone());
     // Occurrences where they are shown, uncaptured moves included, except those the joint solver
@@ -571,7 +643,7 @@ fn save_mesh(s: &mut Session, p: &Value) -> Result<Value> {
             crate::slicers::resolve(spec).ok_or_else(|| bad(cmd, format!("no slicer `{spec}` (see file.slicers, or give the path of a program)")))?,
         ),
     };
-    let mut out = export_to(s, path, format, &string_list(p, "bodies"))?;
+    let mut out = export_to(s, path, format, &string_list(p, "bodies"), p, cmd)?;
     if let (Some(slicer), Some(obj)) = (slicer, out.as_object_mut()) {
         // The file is saved either way; a slicer that won't start is reported, not fatal.
         match slicer.open(path) {
