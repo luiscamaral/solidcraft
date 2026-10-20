@@ -521,6 +521,20 @@ mod tests {
         assert_eq!(selection_click(Held::new(ctrl_only, Platform::Other), false), (true, true));
     }
 
+    /// A selection click adds with the platform's primary key, whatever platform runs the test:
+    /// Ctrl on Windows and Linux (with or without `command` set), Command on macOS, where
+    /// physical Ctrl is a different key and a plain click.
+    #[test]
+    fn selection_click_adds_with_command_on_mac_and_ctrl_elsewhere() {
+        let cmd = Modifiers { mac_cmd: true, command: true, ..Default::default() };
+        let ctrl = Modifiers { ctrl: true, command: true, ..Default::default() };
+        assert_eq!(selection_click(Held::new(cmd, Platform::Mac), false), (true, true));
+        assert_eq!(selection_click(Held::new(Modifiers::CTRL, Platform::Mac), false), (false, false));
+        assert_eq!(selection_click(Held::new(ctrl, Platform::Other), false), (true, true));
+        assert_eq!(selection_click(Held::new(Modifiers::CTRL, Platform::Other), false), (true, true));
+        assert_eq!(selection_click(Held::new(Modifiers::SHIFT, Platform::Mac), false), (true, true));
+    }
+
     #[test]
     fn cmd_normalises_to_ctrl() {
         let ctrl = ModifierCombo::CTRL;
