@@ -53,8 +53,12 @@ pub fn default_dir() -> Option<PathBuf> {
 /// SolidCraft's per-user data folder (the recovery folder's parent unless
 /// `SOLIDCRAFT_RECOVERY_DIR` moves that): `%LOCALAPPDATA%\SolidCraft`,
 /// `~/Library/Application Support/SolidCraft`, or `$XDG_DATA_HOME/solidcraft`
-/// (`~/.local/share/solidcraft`).
+/// (`~/.local/share/solidcraft`). `SOLIDCRAFT_DATA_DIR` replaces it, so a side-by-side build keeps
+/// its plugins, agent chats and connected apps apart from an installed release's.
 pub fn data_dir() -> Option<PathBuf> {
+    if let Some(d) = solidcraft_geom::env::var_os("DATA_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(d));
+    }
     let env = |k: &str| std::env::var_os(k).filter(|d| !d.is_empty()).map(PathBuf::from);
     if cfg!(windows) {
         Some(env("LOCALAPPDATA")?.join("SolidCraft"))
