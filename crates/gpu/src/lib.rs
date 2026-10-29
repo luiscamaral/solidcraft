@@ -20,6 +20,9 @@ use solidcraft_geom::tess::{EvalCurve, EvalSurface, TessPlan};
 use wgpu::util::DeviceExt;
 
 pub mod capture;
+pub mod concurrent;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod path;
 mod pbr;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod select;
@@ -58,6 +61,22 @@ fn popped(f: impl std::future::Future<Output = Option<wgpu::Error>>) -> Option<w
     }
 }
 
+/// Error scopes catching what GPU work may raise (popped by [`caught`]).
+fn error_scopes(device: &wgpu::Device) -> [wgpu::ErrorScopeGuard; 3] {
+    [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Internal, wgpu::ErrorFilter::Validation].map(|f| device.push_error_scope(f))
+}
+
+/// The first error the scopes caught.
+fn caught(scopes: [wgpu::ErrorScopeGuard; 3]) -> Option<String> {
+    let mut failed = None;
+    for scope in scopes.into_iter().rev() {
+        if let Some(e) = popped(scope.pop()) {
+            failed.get_or_insert(e.to_string());
+        }
+    }
+    failed
+}
+
 /// An adapter and device without a window (native only): the adapter [`select::pick`] chooses
 /// under the `SOLIDCRAFT_GPU` policy. The environment may narrow the backends and pick the D3D12
 /// shader compiler (`WGPU_BACKEND`, `WGPU_DX12_COMPILER`).
@@ -65,14 +84,19 @@ fn popped(f: impl std::future::Future<Output = Option<wgpu::Error>>) -> Option<w
 fn open_headless() -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
     let policy = select::Policy::from_env().map_err(GpuError::Policy)?;
     let (adapter, _) = select::pick(policy).ok_or(GpuError::NoAdapter(policy.name()))?;
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    let (device, queue) = open_device(&adapter)?;
+    Ok((adapter, device, queue))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)> {
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("solidcraft headless"),
-        required_features: depth_features(&adapter),
+        required_features: depth_features(adapter),
         required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
         ..Default::default()
     }))
-    .map_err(|e| GpuError::Device(e.to_string()))?;
-    Ok((adapter, device, queue))
+    .map_err(|e| GpuError::Device(e.to_string()))
 }
 
 /// Most vertices evaluated in one dispatch (bounds the buffers; larger plans go in batches).
@@ -134,6 +158,7 @@ pub struct Part {
 }
 
 /// The compute pipeline, ready to evaluate plans on one device.
+#[derive(Clone)]
 pub struct TessGpu {
     adapter: String,
     device: wgpu::Device,

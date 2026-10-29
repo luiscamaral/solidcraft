@@ -25,19 +25,45 @@ const RESOURCE_NOT_FOUND: i64 = -32002;
 /// Most messages in one JSON-RPC batch.
 const MAX_BATCH: usize = 1000;
 
-const INSTRUCTIONS: &str = "SolidCraft is an independent parametric 3D CAD app. Units are millimetres \
+const INSTRUCTIONS: &str = "SolidCraft is an independent parametric 3D CAD app, and these tools drive it: when its window is \
+open the user watches the model appear, otherwise a headless session builds it. When asked to design or build a part \
+(a bracket, an enclosure, a gear) do it with these tools straight away; nothing needs explaining first. Units are millimetres \
 and degrees in expressions (internally radians), Z is up. Model like this: `sketch.create {plane: XY}`, draw \
 (`sketch.rectangle.two_point {p0, p1}`, `sketch.circle.center {center, radius}`, `sketch.line {points, closed}`), constrain \
 and dimension (`sketch.dimension {entities, value}`; values may name parameters), `sketch.finish`, then features \
 (`solid.extrude {distance, operation?: new|join|cut|intersect}`, `solid.revolve`, `solid.fillet {edges: [[x,y,z] point on \
 edge], radius}`, `solid.chamfer`, patterns, mirror, primitives). Use `batch` for several steps at once, \
-`list_commands` for ids and parameter docs, `describe_command` for a command's schemas, `inspect_design` / `measure` to verify, `body_topology` to find edge points, \
-`set_parameter` to drive the design and `screenshot` to look at it.";
+`list_commands` for ids and parameter docs, `describe_command` for a command's schemas, `inspect_design` / `measure` to verify, \
+`body_topology` to find edge points, `set_parameter` to drive the design and `screenshot` to look at it. A call whose error \
+starts `still running:` was not cancelled: don't send it again; `pending` waits for its result.";
 
 pub struct Server {
     backend: Box<dyn Backend>,
     initialized: bool,
     scope: Option<PathScope>,
+}
+
+/// The design files a call opens or saves (#7181): `open` and `save`, and the commands they run
+/// (`doc.open`, `file.save`, `file.save_as`) through `execute` or as `batch` steps. Each reads or
+/// writes the file it names through the agent's scope.
+fn design_files(name: &str, args: &Value) -> Vec<String> {
+    let step = |command: &str, params: &Value| {
+        let params = match command {
+            "open" | "save" | "doc.open" | "file.save" | "file.save_as" => params,
+            "execute" if matches!(params["command"].as_str(), Some("doc.open" | "file.save" | "file.save_as")) => &params["params"],
+            _ => return None,
+        };
+        params["path"].as_str().map(str::to_owned)
+    };
+    match name {
+        "batch" => args["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| step(s["command"].as_str().or_else(|| s["id"].as_str())?, &s["params"]))
+            .collect(),
+        _ => step(name, args).into_iter().collect(),
+    }
 }
 
 fn response(id: Value, result: Value) -> Value {
@@ -182,10 +208,27 @@ impl Server {
                     Some(a) => a.clone(),
                 };
                 check_arguments(name, &args).map_err(|e| (INVALID_PARAMS, e))?;
-                // The open design's folder counts as it is now (a save-as or open moves it).
-                let scope = self.scope.clone().map(|s| s.with_design(self.backend.design_path().as_deref()));
+                // The open design's folder counts, and goes on counting for the rest of this run
+                // when a save-as or open moves the design elsewhere (#7181).
+                let open = self.backend.design_path();
+                self.scope = self.scope.take().map(|s| s.with_design(open.as_deref()));
+                let scope = self.scope.clone();
                 let backend = self.backend.as_mut();
-                Ok(vfs::scoped(scope, || call_tool(backend, name, &args)))
+                let mut result = vfs::scoped(scope, || call_tool(backend, name, &args));
+                // So does the folder of each design file the call opened or saved: the call reached
+                // it, so it was one of the agent's folders already. Only paths given in full: a
+                // running app resolves a relative one against its own working folder.
+                if result["isError"] != true {
+                    for file in design_files(name, &args).iter().filter(|f| std::path::Path::new(f).is_absolute()) {
+                        self.scope = self.scope.take().map(|s| s.with_design_file(file));
+                    }
+                }
+                if let Some(note) = backend.notice()
+                    && let Some(content) = result.get_mut("content").and_then(Value::as_array_mut)
+                {
+                    content.push(json!({"type": "text", "text": note}));
+                }
+                Ok(result)
             }
             "resources/list" => Ok(json!({"resources": [
                 {"uri": "solidcraft://design", "name": "Active design", "description": "document.inspect with measurements", "mimeType": "application/json"},

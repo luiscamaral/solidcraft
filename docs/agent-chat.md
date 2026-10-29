@@ -20,6 +20,17 @@ Everything about it is on one page: **Preferences → AI**.
 - **Show Assistant button in application bar** (on by default): the **Assistant** icon in the application bar
   row, which stays there however wide the window is. Turn it off to keep only the shortcut and
   the menu entry.
+- **Connect the last-used agent when SolidCraft starts** (off by default): each launch starts
+  the agent you connected last (the default one if you never connected), in the background,
+  once SolidCraft has looked for the installed agents. The panel's header shows **Starting…**,
+  then **Ready**, or **Connection failed** with **Retry** in place of **Connect** (the agent is
+  missing, could not start, or ended while starting); the conversation says why. A design
+  opened in place of the empty one SolidCraft starts with keeps the agent connected, as long
+  as nothing was asked in that empty design's chat.
+- **Open the Assistant panel when SolidCraft starts** (off by default): the panel (or its own
+  window) is shown at each launch.
+
+Neither applies when SolidCraft is started with `--control` for automation.
 
 With AI features on, the panel opens from:
 
@@ -29,7 +40,7 @@ With AI features on, the panel opens from:
 
 Nothing runs until you need it: SolidCraft looks for installed agents (a quick `--version`
 each, in the background) when the panel or the AI page first opens, and starts an agent only
-when you send a message or press **Connect**.
+when you send a message or press **Connect** (or at launch, when you turned that on above).
 
 ## The panel
 
@@ -57,7 +68,11 @@ clicks and scrolling over the panel stay in the chat. The docked layout retains 
   model list, or an endpoint's `/models`), a model drop-down shows the one in use and changes it;
   SolidCraft remembers the last choice for each agent and puts it back on the next session. An
   endpoint's agent also keeps it as its default model. An agent that reports no models shows no
-  drop-down.
+  drop-down. When the models come from more than one provider (Hermes and OpenCode name each
+  model `Provider · model`, or say `Provider: …` in its description), a provider drop-down comes
+  first and the model drop-down lists only that provider's models, without the provider in front.
+  It opens on the provider of the model in use; picking another provider changes nothing until one
+  of its models is chosen. Models with no provider named are listed under *Other*.
 
 Messages use right-aligned user bubbles and plain assistant text. Consecutive tool calls share
 an activity group: click a row to inspect its output; failed calls have an error tint. Approval
@@ -108,6 +123,12 @@ clears the files waiting on the chips too.
 
 ## Typing while the agent works
 
+Each design tab has its own conversation, agent session, draft, attachments and queued messages.
+A new tab starts with an empty chat. Switching away stops the current turn and keeps its
+completed changes in that design's undo history. Returning restores the conversation; queued
+messages wait for **Send**. Closing a design closes its conversation. Conversations are kept
+only while the tabs remain open.
+
 The input stays enabled during a turn. **Enter** queues the message: it shows in the conversation
 as a **Queued** bubble that you can **Edit** or remove (×) until it is sent. Several queued
 messages go as one prompt, in order, when the turn ends normally.
@@ -134,14 +155,18 @@ conversation starts with), its own permission setting, and **Remove** for the on
 SolidCraft looks for agents that speak the [Agent Client Protocol](https://agentclientprotocol.com)
 on your `PATH` and in the usual install folders a desktop app's `PATH` often misses (npm's
 global folder, nvm, Volta, bun, `~/.local/bin`, `~/.grok/bin`, Homebrew, `%APPDATA%\npm`). For each one it
-shows its **version** (from `--version`, given three seconds) and whether it looks **signed in**.
+shows its **version** (from `--version`, given three seconds) and whether a **login was found**.
 Version checks and agent sessions also use those folders on their `PATH`, so adapters can find
 runtimes such as Node when SolidCraft is opened from Finder or the Dock. Existing absolute
 `PATH` entries keep their order; no shell startup files are run.
 SolidCraft only checks whether the agent's own login file (`~/.claude/.credentials.json`,
 `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`, …) or one of its key variables exists. It never
 reads the file and never starts the agent to find out. On macOS Claude Code keeps its login in
-the keychain, so SolidCraft doesn't guess there.
+the keychain, so SolidCraft doesn't guess there. A found login file may be expired: **Test** or a
+chat connection verifies it. A successful ACP connection shows **signed in**; an authentication
+rejection shows **not signed in**. These results apply to that agent until a newer connection
+result or **Refresh**, which checks the installed agents again. An unrelated connection error
+doesn't change the last known login state.
 
 | Agent | What to install |
 |---|---|
@@ -163,7 +188,7 @@ through nvm or `~/.local/bin` can therefore work in a terminal while SolidCraft 
 that no agent was found. For Claude Code and its ACP adapter, run:
 
 ```sh
-flatpak override --user ai.storyteller.solidcraft --filesystem=~/.nvm:ro --filesystem=~/.local/bin:ro --filesystem=~/.local/share/claude:ro --filesystem=~/.claude --filesystem=~/.claude.json --share=network
+flatpak override --user io.tangencylabs.solidcraft --filesystem=~/.nvm:ro --filesystem=~/.local/bin:ro --filesystem=~/.local/share/claude:ro --filesystem=~/.claude --filesystem=~/.claude.json --share=network
 ```
 
 These permissions apply to SolidCraft for your user account:
@@ -199,7 +224,13 @@ Grok Build also supports `XAI_API_KEY` for users who choose API authentication.
 - **Custom command:** any other program that speaks ACP on stdin and stdout, such as
   `my-agent --acp`. SolidCraft starts it directly, not through a shell.
 - **OpenAI-compatible API:** a preset (Ollama `http://localhost:11434/v1`, LM Studio
-  `http://localhost:1234/v1`, OpenAI) or a custom URL, the model name, and an optional key.
+  `http://localhost:1234/v1`, OpenAI, Mammouth AI `https://api.mammouth.ai/v1`, OpenCode Go `https://opencode.ai/zen/go/v1`) or a custom URL, the model name, and an optional key.
+  OpenCode Go models are routed to their endpoint by themselves (`/responses`,
+  `/messages` or Gemini for those families, `/chat/completions` for the rest),
+  each conversation request carrying the session header Go asks for, so one
+  preset covers every model.
+  A model the list does not know is retried on the next protocol when Go names
+  the mismatch.
 - **Anthropic-compatible API:** a preset (Anthropic) or a custom URL, for an endpoint that
   speaks the Anthropic Messages API (`{base}/v1/messages`). This covers Anthropic itself and
   providers that offer an Anthropic-compatible endpoint, such as DeepSeek and Qwen.
@@ -208,7 +239,46 @@ Grok Build also supports `XAI_API_KEY` for users who choose API authentication.
   OpenAI-compatible endpoint for its models; an Anthropic-compatible one gets a short message,
   because not every such endpoint lists models (Qwen's has no model list). For these agents
   SolidCraft runs the conversation itself, with the same tools, limits and questions as for a
-  coding agent, and at most 24 model requests per message.
+  coding agent, and no cap on model requests per message (Stop ends it). **Request timeout** is how long one model request may
+  take: 300 s by default, from 30 s to an hour. A slow local model (a large model on modest
+  hardware, or a long message with many tool results) may need more; raise it here or in the
+  endpoint's entry under **Agents**, where a change applies from the next request. A request that
+  runs out of time ends the message with the limit it hit and where to raise it.
+
+For Ollama, choosing a model checks its reported capabilities in the background. If its
+capabilities list lacks `tools`, a warning below the model picker explains that the model can
+only chat and suggests choosing one with tool support. Results are cached in memory per base URL and
+model, with a limit of 128 entries. SolidCraft recognises Ollama through `/api/version` at the
+endpoint's origin or the Ollama preset. Failed checks and older servers without a capabilities
+field show no warning. The check never blocks sending a message.
+
+### Local models
+
+Choose a model that supports native tool calling to read or change the design. With Ollama,
+look for `tools` in the model's capabilities; a model that only supports chat cannot operate
+SolidCraft. Other OpenAI-compatible endpoints also need a model with native tool support.
+
+If tools were available but a completed turn made no tool calls or changes, the panel shows a
+short notice when the reply was empty, or when an explicit edit request received only text.
+Ordinary answers to questions do not show it. Edit requests are recognised conservatively from
+English opening words such as “make”, “rename”, or “can you move”; other phrasing may stay quiet.
+Cancelled and failed turns keep their existing messages. Text describing a call is never run.
+
+### An agent inside WSL (Windows)
+
+An agent installed inside WSL keeps its own settings, skills and sign-in there. Add it as a
+**Custom command** that starts it through `wsl.exe`, for example:
+
+```
+wsl.exe -d Ubuntu -e bash -lc claude-agent-acp
+```
+
+`bash -lc` runs your login shell's setup, so the agent is found where your `PATH` puts it (npm,
+nvm, Volta). When the command's program is `wsl` or `wsl.exe`, SolidCraft gives the agent its
+working folder and the `solidcraft-app` server's program as WSL shows them (`C:\Users\…` becomes
+`/mnt/c/Users/…`). The server itself still runs on Windows and reaches the app at `127.0.0.1`, so
+this works with WSL's default networking. If you moved WSL's drive mounts away from `/mnt`
+(`automount.root` in `/etc/wsl.conf`), those paths won't match and the agent can't start the server.
 
 ## Signing in
 
@@ -247,6 +317,22 @@ The agent reaches the open design only through SolidCraft's own tools (the
   while you do; click it to open the viewer (the message's pictures one at a time, with **‹** and
   **›** or the arrow keys, closed with Esc or a click outside). A long message scrolls inside its
   box, so **Send** and the buttons beside it stay in view.
+- **Attach selection:** tick it to send what is selected in the model with your message, so the
+  agent knows what "this edge" or "that feature" is. The box shows how many things are selected, counted as you clicked them (the two halves of a rim you clicked once are one).
+  Faces and edges go with the names and numbers the agent's tools take and with their size and
+  place (so they can be found again after an edit), features with their name and kind, bodies with
+  their name. The agent gets them as text after your message; the conversation shows your message
+  as typed with the things as chips below it, grouped (Elements, Features, Bodies) with a count;
+  hover a chip for what the agent was told about it. At most 64 things go with one message; the
+  rest are counted ("+N more"), not dropped silently. The selection is read when you send, also for
+  a message that waits in the queue.
+- **Pick context:** press it to choose what the message is about on purpose. A picker opens with
+  three lists, **Elements** (faces, edges, vertices), **Features** (steps of the timeline) and
+  **Bodies**; click things in the model, the timeline or the browser to put them in the list that
+  is active (click a list to make it active; click a picked thing again to take it out). **OK**
+  puts them as chips above the message box, each with a **×**; they go with the next message like
+  an attached selection (and are shown the same way), and the box is empty again afterwards.
+  **Cancel** keeps what was picked before.
 
 ## Permissions
 
@@ -282,9 +368,10 @@ saves, opens or inserts. A sweep's or pattern's `path` (curve ids) and an occurr
   everything that's waiting, and a question nobody answers is declined after four minutes. The
   [MCP server's folder limits](mcp.md) still apply after you allow: the design's folder, the
   recovery folder and the server's own scratch folder.
-- **A limit per message.** The agent may make 24 changes per message by default; you can set
-  the number on the AI page. Reading the design doesn't count. When it reaches the limit, it's
-  told to stop and report what's left; send another message to let it carry on.
+- **An optional limit per message.** There's none by default. Untick **Unlimited** on the AI
+  page to cap the changes the agent may make per message (it starts at 24). Reading the design
+  doesn't count. At the limit, it's told to stop and report what's left; send another message to
+  let it carry on. **Stop** always works.
 - **No crash reports,** whatever the permissions. Crash reports can hold other designs and file
   paths.
 - **Not the rest of the app.** It can't click the interface, change settings, quit, or drive the
