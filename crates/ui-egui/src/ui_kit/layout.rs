@@ -171,6 +171,28 @@ pub(crate) fn row<R>(ui: &mut Ui, text: &str, control: impl FnOnce(&mut Ui) -> R
     sized_row(ui, text, row_height(), control)
 }
 
+/// Semantic ink for a form's explanatory message.
+#[derive(Clone, Copy)]
+pub(crate) enum StatusTone {
+    Dim,
+    Warning,
+    Error,
+}
+
+/// Full-width, wrapping status or refusal text. Place directly in the form, outside a `row`:
+/// rows clip their controls to one line. Tokens: `font_label, text_dim, warning, error`.
+pub(crate) fn status_line(ui: &mut Ui, text: &str, tone: StatusTone) -> Response {
+    let t = Tokens::get();
+    let ink = match tone {
+        StatusTone::Dim => t.text_dim,
+        StatusTone::Warning => t.warning,
+        StatusTone::Error => t.error,
+    };
+    let response = ui.add(egui::Label::new(RichText::new(crate::i18n::tr_label(text)).size(t.font_label).color(ink)).wrap());
+    scenario::publish_rect(&format!("dialog:status:{text}"), response.rect);
+    response
+}
+
 /// Declarative expression row; retains the field's completion and accepted Enter. Tokens: `row, field`.
 pub(crate) fn expr_row(ui: &mut Ui, label: &str, value: &mut String) -> bool {
     row(ui, label, |ui| super::field(ui, value))
@@ -340,6 +362,18 @@ pub(crate) fn section_heading(ui: &mut Ui, title: &str) {
 
 pub(crate) fn section<R>(ui: &mut Ui, id: impl egui::AsIdSalt, title: &str, default_open: bool, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     section_count(ui, id, title, default_open, None::<usize>, add)
+}
+
+/// Section with a renderer/method tag. Shares disclosure, typography and badge tokens with section_count.
+pub(crate) fn section_method<R>(
+    ui: &mut Ui,
+    id: impl egui::AsIdSalt,
+    title: &str,
+    default_open: bool,
+    method: &str,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> Option<R> {
+    section_count(ui, id, title, default_open, Some(method), add)
 }
 
 /// Section heading with an optional count badge; disclosure state uses the same identity.
@@ -620,6 +654,17 @@ pub(crate) enum Text<'a> {
     Value(&'a str, bool),
 }
 
+fn note_galley(ui: &Ui, text: &str) -> std::sync::Arc<egui::Galley> {
+    let t = Tokens::get();
+    ui.painter().layout(text.to_owned(), egui::FontId::proportional(t.font_small), t.form_dim, dimension(ui.available_width()))
+}
+
+/// Reserve the actual wrapped note height when budgeting a bounded card's scroll area.
+#[cfg(test)]
+pub(crate) fn note_height(ui: &Ui, text: &str) -> f32 {
+    note_galley(ui, text).size().y + Tokens::get().space_4 * 2.0
+}
+
 pub(crate) fn text(ui: &mut Ui, text: &str, style: Text<'_>) -> Response {
     if crate::prefs_search::querying(ui) {
         let heading = matches!(style, Text::Heading(_));
@@ -676,7 +721,7 @@ pub(crate) fn text(ui: &mut Ui, text: &str, style: Text<'_>) -> Response {
             .inner
     } else if matches!(style, Text::Hint(_) | Text::Note(_) | Text::MonoNote(_)) {
         let width = dimension(ui.available_width());
-        let galley = ui.painter().layout(text.to_owned(), font, ink, width);
+        let galley = if matches!(style, Text::Note(_)) { note_galley(ui, text) } else { ui.painter().layout(text.to_owned(), font, ink, width) };
         let padding = if matches!(style, Text::Note(_) | Text::MonoNote(_)) { t.space_4 } else { 0.0 };
         let (rect, response) = ui.allocate_exact_size(vec2(width, galley.size().y + padding * 2.0), egui::Sense::hover());
         ui.painter().galley(egui::pos2(rect.left(), rect.top() + padding), galley, ink);

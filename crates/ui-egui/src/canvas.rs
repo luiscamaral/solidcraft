@@ -275,7 +275,8 @@ pub(crate) fn chamfer_face_dirs(app: &SolveApp, d: &Dialog, at: Vec3) -> Option<
 pub(crate) fn owns_pointer(app: &SolveApp, proj: &Proj, p: Pos2) -> bool {
     // The triad only registers an egui hit widget after a handle is under the pointer.
     // Test its geometry before navigation, including the first frame entering a handle.
-    app.dialog.as_ref().and_then(|d| crate::dialogs_move::triad(app, d)).is_some_and(|t| crate::gizmo::contains_pointer(proj, &t, p))
+    crate::joint_handles::owns_pointer(app, proj, p)
+        || app.dialog.as_ref().and_then(|d| crate::dialogs_move::triad(app, d)).is_some_and(|t| crate::gizmo::contains_pointer(proj, &t, p))
         || app
             .dialog
             .as_ref()
@@ -856,7 +857,9 @@ fn value_box_full(
         at
     };
     let mut field = None;
-    Container::new(ui.ctx(), Surface::Canvas).area(area).fixed_pos(at).pivot(pivot).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+    // Background: under Preferences, Report a bug and other system windows (#9016). The box is
+    // already kept clear of the command window (#6608), which floats at Middle with Features.
+    Container::new(ui.ctx(), Surface::Canvas).area(area).fixed_pos(at).pivot(pivot).order(egui::Order::Background).show(ui.ctx(), |ui| {
         Container::popup_frame(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(crate::i18n::tr_label(label)).color(t.text_dim).size(crate::theme::Tokens::get().font_caption));
@@ -1189,7 +1192,13 @@ fn radius_spline_handles(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Pain
         let at = |u: f64| e.start + (e.other - e.start) * u;
         let g = e.spline.greville();
         let tips: Vec<Option<Pos2>> = g.iter().zip(&e.spline.radii).map(|(u, r)| proj.to_screen(at(*u) + e.n * *r)).collect();
-        painter.add(egui::Shape::dashed_line(&tips.iter().flatten().copied().collect::<Vec<_>>(), Stroke::new(1.0, t.manipulator), 4.0, 3.0));
+        painter.extend(crate::viewport::dashed_line(
+            &tips.iter().flatten().copied().collect::<Vec<_>>(),
+            painter.clip_rect(),
+            Stroke::new(1.0, t.manipulator),
+            4.0,
+            3.0,
+        ));
         for (k, (u, ts)) in g.iter().zip(&tips).enumerate() {
             let Some(ts) = *ts else { continue };
             crate::scenario::publish_handle(&if i == 0 { format!("fillet_r{k}") } else { format!("fillet_e{i}_r{k}") }, ts);
@@ -1329,7 +1338,7 @@ fn measure_components(app: &SolveApp, painter: &egui::Painter, proj: &Proj, a: V
         let (at, offset) = if let Some((sa, sb)) = screen {
             let leg = sb - sa;
             if leg.length_sq() > 1.0 {
-                painter.add(egui::Shape::dashed_line(&[sa, sb], Stroke::new(1.5, color), 5.0, 3.0));
+                painter.extend(crate::viewport::dashed_line(&[sa, sb], painter.clip_rect(), Stroke::new(1.5, color), 5.0, 3.0));
                 let normal = vec2(-leg.y, leg.x).normalized();
                 for p in [sa, sb] {
                     painter.line_segment([p - normal * 3.0, p + normal * 3.0], Stroke::new(1.0, color));
@@ -1413,7 +1422,7 @@ fn taper_handle(
     crate::scenario::publish_handle("taper", es);
     let hot = r.hovered() || r.dragged();
     let col = if hot { t.accent } else { t.manipulator };
-    painter.add(egui::Shape::dashed_line(&[fs, es], Stroke::new(1.2, col), 5.0, 3.0));
+    painter.extend(crate::viewport::dashed_line(&[fs, es], painter.clip_rect(), Stroke::new(1.2, col), 5.0, 3.0));
     painter.circle(es, if hot { 6.5 } else { 5.0 }, t.overlay, Stroke::new(2.0, col));
     if hot {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -1593,7 +1602,7 @@ fn draw_revolve(
         let area = Container::new(ui.ctx(), Surface::Canvas)
             .area(egui::Id::new("sc_canvas_area"))
             .fixed_pos(box_at)
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Background)
             .interactable(false);
         area.show(ui.ctx(), |ui| {
             Container::popup_frame(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
@@ -1845,8 +1854,8 @@ mod tests {
     }
 
     /// #6608: a value box that has to move out of the command window does not cover the
-    /// manipulator's handles: the box is a foreground area, so it took the press and the drag
-    /// on a ring never reached the model.
+    /// manipulator's handles: when it covered a handle it took the press and the drag on a ring
+    /// never reached the model.
     #[test]
     fn a_value_box_keeps_clear_of_the_handles() {
         let mut h = crate::scenario::Harness::new();
@@ -1887,6 +1896,31 @@ mod tests {
         let clear = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(140.0, 24.0));
         let place = BoxPlace { dialog: Some(dialog), view: Some(view), handles: None };
         assert_eq!(clear_of_dialog(clear, place), clear, "a box that misses the window stays");
+    }
+
+    /// Canvas value boxes sit under Preferences and Report a bug (#9016).
+    #[test]
+    fn a_value_box_draws_under_system_windows() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", serde_json::json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+        h.step(&serde_json::json!({"start": "solid.move"})).unwrap();
+        h.frames(6);
+        let order = |h: &crate::scenario::Harness| {
+            h.ctx.memory(|m| m.areas().visible_layer_ids().into_iter().find(|l| l.id == egui::Id::new("sc_canvas_area")).map(|l| l.order))
+        };
+        assert_eq!(order(&h), Some(egui::Order::Background), "the value box belongs under system windows");
+        h.call("ui.prefs", serde_json::json!({"open": "General"}));
+        h.frames(3);
+        let window = h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_prefs"))).expect("Preferences");
+        let box_rect = h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_canvas_area"))).expect("the value box");
+        assert!(order(&h) < Some(egui::Order::Middle), "Preferences draws over the value box");
+        if window.intersects(box_rect) {
+            assert!(
+                h.ctx.memory(|m| m.layer_id_at(box_rect.center())).is_some_and(|l| l.id == egui::Id::new("sc_prefs")),
+                "Preferences covers the Distance box where they overlap"
+            );
+        }
     }
 
     /// A box that would cover a handle moves off it, and one that cannot clear both the window

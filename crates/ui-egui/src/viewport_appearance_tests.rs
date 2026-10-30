@@ -202,6 +202,29 @@ fn a_colour_edit_reuses_every_block_vertex() {
 }
 
 #[test]
+fn a_material_colour_edit_its_undo_and_redo_reach_the_viewport() {
+    let mut app = SolveApp::new(Session::default(), Services::default());
+    app.ui.ground_shadow = false;
+    app.set_origin_shown(false);
+    app.run("solid.box", json!({"length": 20, "width": 15, "height": 10})).unwrap();
+    let name = app.session.world_state().bodies[0].name.clone();
+    app.run("material.create", json!({"name": "Wood dark", "density_g_cm3": 0.7, "color": "#c8a573"})).unwrap();
+    app.run("material.assign", json!({"bodies": [name], "material": "Wood dark"})).unwrap();
+    let colour = |app: &SolveApp| {
+        let scene = build_scene(app);
+        let block = scene.blocks.iter().find(|b| !b.bytes.vertices.is_empty()).expect("the box has a block");
+        first_vertex(&scene, &block.bytes.vertices).1
+    };
+    assert_eq!(colour(&app), Some([0xc8, 0xa5, 0x73, 255]));
+    app.run("material.edit", json!({"material": "Wood dark", "color": "#ccb799"})).unwrap();
+    assert_eq!(colour(&app), Some([0xcc, 0xb7, 0x99, 255]), "the edited material colour is drawn");
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(colour(&app), Some([0xc8, 0xa5, 0x73, 255]), "undo draws the old colour again");
+    app.run("edit.redo", json!({})).unwrap();
+    assert_eq!(colour(&app), Some([0xcc, 0xb7, 0x99, 255]), "redo draws the edited colour again");
+}
+
+#[test]
 fn an_opacity_class_change_keeps_vertices_and_rewrites_only_the_runs() {
     let mut app = SolveApp::new(Session::default(), Services::default());
     app.ui.ground_shadow = false;
@@ -509,4 +532,41 @@ fn conflicting_curves_points_glyphs_and_dimensions_take_the_conflict_colour_unti
     }
     h.call("ui.prefs", json!({"theme": "dark"}));
     h.frame();
+}
+
+/// Vertex markers follow the edges (#7834): a box's eight corners are marked once each in the
+/// edge colour wherever edges are drawn (shaded with edges, wireframe, shaded with hidden
+/// edges), faintly behind the model where hidden edges are, and not at all in plain shaded.
+#[test]
+fn vertex_markers_follow_the_edges_display_mode() {
+    let mut app = SolveApp::new(Session::default(), Services::default());
+    app.ui.ground_shadow = false;
+    app.set_origin_shown(false);
+    app.run("solid.box", json!({"length": 20, "width": 15, "height": 10})).unwrap();
+    // Off by default: no marker in any style.
+    assert!(!app.preferences.vertex_markers, "vertex markers are off by default");
+    for style in 0..4 {
+        app.ui.visual_style = style;
+        let scene = build_scene(&app).merged();
+        let dots = |bytes: &[u8]| bytes.as_chunks::<{ crate::gpu::LINE_SIZE }>().0.iter().filter(|r| r[..12] == r[12..24]).count();
+        assert_eq!((dots(&scene.lines), dots(&scene.hidden)), (0, 0), "style {style}: no markers by default");
+    }
+    app.preferences.vertex_markers = true;
+    // A marker is a lifted line from a point to itself.
+    let markers = |scene: &crate::gpu::GpuScene, bytes: &[u8]| -> Vec<([u8; 12], [u8; 4])> {
+        let (records, rest) = bytes.as_chunks::<{ crate::gpu::LINE_SIZE }>();
+        assert!(rest.is_empty());
+        records.iter().filter(|r| r[..12] == r[12..24] && r[31] & 0x80 != 0).map(|r| (r[..12].try_into().unwrap(), line_color(scene, r))).collect()
+    };
+    for (style, drawn, hidden) in [(0, true, false), (1, false, false), (2, true, false), (3, true, true)] {
+        app.ui.visual_style = style;
+        let scene = build_scene(&app).merged();
+        let (front, back) = (markers(&scene, &scene.lines), markers(&scene, &scene.hidden));
+        let edge = scene.lines.as_chunks::<{ crate::gpu::LINE_SIZE }>().0.iter().find(|r| r[..12] != r[12..24]).map(|r| line_color(&scene, r));
+        assert_eq!(front.len(), if drawn { 8 } else { 0 }, "style {style}: one marker per corner");
+        assert_eq!(back.len(), if hidden { 8 } else { 0 }, "style {style}: hidden markers only with hidden edges");
+        let corners: std::collections::HashSet<_> = front.iter().map(|(p, _)| *p).collect();
+        assert_eq!(corners.len(), front.len(), "style {style}: each corner once");
+        assert!(front.iter().all(|(_, c)| Some(*c) == edge), "style {style}: markers in the edge colour");
+    }
 }

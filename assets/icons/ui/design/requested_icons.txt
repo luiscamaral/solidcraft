@@ -95,6 +95,7 @@ edit	false
 ellipse	false
 emboss	false
 environment_map	false
+equation_curve	false
 error	false
 explode	false
 export	false
@@ -144,6 +145,7 @@ loft	false
 lookat	false
 material	false
 measure	false
+mesh_body	false
 mesh_export	false
 min_radius	false
 mirror	false
@@ -223,6 +225,7 @@ settings_monitor	false
 settings_mouse	false
 settings_palette	false
 settings_plug	false
+sheet	false
 sheet_rules	false
 shell	false
 shield	false
@@ -258,6 +261,7 @@ split_face	false
 spun	false
 star	false
 status_error	false
+status_pin	false
 status_recovery	false
 style	false
 style_hidden_edges	false
@@ -289,6 +293,8 @@ svg	false
 sweep	false
 text	false
 thread	false
+timeline_play	false
+timeline_stop	false
 torus	false
 trace	false
 trim	false

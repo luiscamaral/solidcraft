@@ -1,7 +1,198 @@
 use super::*;
 use crate::{scenario::Harness, shell::LayoutMode};
 
+#[test]
+fn viewport_status_specimens_clear_and_open_keys_without_engine_changes() {
+    let mut h = Harness::new();
+    h.call("ui.status_fixture", json!({"preset":"row"}));
+    h.frames(4);
+    let zebra = crate::scenario::rect_of("viewport_status:zebra:item").unwrap();
+    let section = crate::scenario::rect_of("viewport_status:section:item").unwrap();
+    assert!(zebra.right() < section.left());
+    assert!((zebra.center().y - section.center().y).abs() < 1.0, "single row: {zebra:?}, {section:?}");
+    assert!(crate::scenario::rect_of("viewport_status:zebra:key").is_none());
+    assert!(h.app.session.analysis.is_none());
+    h.step(&json!({"click":{"handle":"viewport_status:zebra:close"}})).unwrap();
+    h.frames(2);
+    assert!(crate::scenario::rect_of("viewport_status:zebra:item").is_none());
+    assert!(crate::scenario::rect_of("viewport_status:section:item").is_some());
+    h.call("ui.status_fixture", json!({"preset":"key"}));
+    h.frames(4);
+    h.step(&json!({"click":{"handle":"viewport_status:draft:key"}})).unwrap();
+    h.frames(3);
+    let item = crate::scenario::rect_of("viewport_status:draft:item").unwrap();
+    let card = crate::scenario::rect_of("viewport_status:card").unwrap();
+    assert!(card.top() > item.bottom());
+    assert!((card.left() - item.left()).abs() < 1.0);
+    h.step(&json!({"key":"Enter"})).unwrap();
+    h.frames(2);
+    assert!(crate::scenario::rect_of("viewport_status:card").is_none(), "focused Ghost key toggles with Enter");
+    h.step(&json!({"key":"Space"})).unwrap();
+    h.frames(2);
+    assert!(crate::scenario::rect_of("viewport_status:card").is_some(), "focused Ghost key toggles with Space");
+}
+
+#[test]
+fn viewport_status_kinds_keep_shape_outline_and_typography_across_themes() {
+    use crate::ui_kit::{StatusItem, StatusKind, StatusPresentation, viewport_status_item};
+    let previous = (crate::theme::is_dark(), crate::theme::vision());
+    assert_ne!(StatusKind::Mode.icon(), StatusKind::Result.icon());
+    assert_ne!(StatusKind::Result.icon(), StatusKind::Attention.icon());
+    for dark in [false, true] {
+        for vision in crate::theme::ColorVision::ALL {
+            crate::theme::set_dark(dark);
+            crate::theme::set_vision(vision);
+            let t = Tokens::get();
+            for (kind, outline) in [(StatusKind::Mode, t.accent), (StatusKind::Result, t.border), (StatusKind::Attention, t.warning)] {
+                let ctx = crate::fonts::test_context();
+                let item = StatusItem { id: "test".into(), kind, name: "Draft".into(), setting: "Z · 1°".into(), has_key: true, editable: false };
+                let output = crate::test_support::frame(&ctx, egui::RawInput::default(), |ui| {
+                    viewport_status_item(ui, &item, &mut StatusPresentation::default());
+                });
+                let (mut border, mut mono, mut name) = (false, false, false);
+                for shape in &output.shapes {
+                    crate::test_support::each_shape(&shape.shape, &mut |shape| match shape {
+                        Shape::Rect(rect) if rect.fill == t.overlay && rect.stroke.color == outline => border = true,
+                        Shape::Text(text) if text.galley.job.text == item.setting => {
+                            mono = text.galley.job.sections.first().is_some_and(|s| s.format.font_id.family == egui::FontFamily::Monospace);
+                        }
+                        Shape::Text(text) if text.galley.job.text == item.name => {
+                            name = text.galley.job.sections.first().is_some_and(|s| s.format.font_id == crate::fonts::semibold(t.font_label));
+                        }
+                        _ => {}
+                    });
+                }
+                assert!(border && mono && name, "{dark:?} {vision:?} {kind:?}: outline {border}, mono {mono}, name {name}");
+            }
+        }
+    }
+    crate::theme::set_dark(previous.0);
+    crate::theme::set_vision(previous.1);
+}
+
+#[test]
+fn viewport_status_every_part_is_centred_within_its_pill_in_every_theme() {
+    use crate::ui_kit::{StatusItem, StatusKind, StatusPresentation, viewport_status_item};
+    let previous = (crate::theme::is_dark(), crate::theme::vision());
+    for dark in [false, true] {
+        for vision in crate::theme::ColorVision::ALL {
+            crate::theme::set_dark(dark);
+            crate::theme::set_vision(vision);
+            for kind in [StatusKind::Mode, StatusKind::Result, StatusKind::Attention] {
+                for (name, setting, has_key, editable) in [
+                    ("Zebra", "12 stripes", false, false),
+                    ("A longer surface analysis name", "R 1234.5 mm", true, false),
+                    ("Mass centre", "", false, false),
+                    ("Draft", "Z · 1°", true, true),
+                ] {
+                    let ctx = crate::fonts::test_context();
+                    let item = StatusItem { id: "centred".into(), kind, name: name.into(), setting: setting.into(), has_key, editable };
+                    let output = crate::test_support::frame(&ctx, egui::RawInput::default(), |ui| {
+                        viewport_status_item(ui, &item, &mut StatusPresentation::default());
+                    });
+                    let pill = crate::scenario::rect_of("viewport_status:centred:item").unwrap();
+                    let centre = pill.center().y;
+                    let mut parts = vec!["icon", "name", "close", "close_glyph"];
+                    if !setting.is_empty() {
+                        parts.push("setting");
+                    }
+                    if has_key {
+                        parts.extend(["key", "key_glyph"]);
+                    }
+                    for part in parts {
+                        let rect = crate::scenario::rect_of(&format!("viewport_status:centred:{part}")).unwrap();
+                        assert!((rect.center().y - centre).abs() <= 0.5, "{dark:?} {vision:?} {kind:?} {name} {part}: {rect:?}, pill {pill:?}");
+                        assert!(pill.contains_rect(rect), "{part} stays inside its pill");
+                    }
+                    let mut text_centres = Vec::new();
+                    for shape in &output.shapes {
+                        crate::test_support::each_shape(&shape.shape, &mut |shape| {
+                            if let Shape::Text(text) = shape
+                                && (text.galley.job.text == name || (!setting.is_empty() && text.galley.job.text == setting))
+                            {
+                                text_centres.push(text.pos.y + text.galley.size().y / 2.0);
+                            }
+                        });
+                    }
+                    assert_eq!(text_centres.len(), if setting.is_empty() { 1 } else { 2 });
+                    assert!(
+                        text_centres.iter().all(|y| (*y - centre).abs() <= 0.5),
+                        "painted text must share the pill centre: {text_centres:?}, {pill:?}"
+                    );
+                }
+            }
+        }
+    }
+    crate::theme::set_dark(previous.0);
+    crate::theme::set_vision(previous.1);
+}
+
 // These tests inspect shapes without submitting their texture uploads to a renderer.
+#[test]
+fn viewport_status_close_hover_has_a_theme_fill_and_native_space_action_in_every_mode() {
+    use crate::ui_kit::{StatusAction, StatusItem, StatusKind, StatusPresentation, viewport_status_item};
+
+    fn paint(
+        ctx: &egui::Context,
+        item: &StatusItem,
+        state: &mut StatusPresentation,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Option<StatusAction>) {
+        let mut action = None;
+        let mut output = crate::test_support::frame(ctx, egui::RawInput { events, focused: true, ..Default::default() }, |ui| {
+            action = viewport_status_item(ui, item, state).1;
+        });
+        output.textures_delta.clear();
+        (output, action)
+    }
+
+    fn has_hover_fill(output: &egui::FullOutput, target: Rect, t: Tokens) -> bool {
+        let mut found = false;
+        for shape in &output.shapes {
+            crate::test_support::each_shape(&shape.shape, &mut |shape| {
+                if let Shape::Rect(rect) = shape {
+                    found |= rect.rect == target && rect.fill == t.hover && rect.corner_radius == t.control_radius.into();
+                }
+            });
+        }
+        found
+    }
+
+    let previous = (crate::theme::is_dark(), crate::theme::vision());
+    for dark in [false, true] {
+        for vision in crate::theme::ColorVision::ALL {
+            crate::theme::set_dark(dark);
+            crate::theme::set_vision(vision);
+            let t = Tokens::get();
+            let ctx = crate::fonts::test_context();
+            let item = StatusItem {
+                id: "hover".into(),
+                kind: StatusKind::Mode,
+                name: "Zebra".into(),
+                setting: "12 stripes".into(),
+                has_key: false,
+                editable: false,
+            };
+            let mut state = StatusPresentation::default();
+            let (rest, action) = paint(&ctx, &item, &mut state, vec![]);
+            let close = crate::scenario::rect_of("viewport_status:hover:close").unwrap();
+            assert!(action.is_none());
+            assert!(!has_hover_fill(&rest, close, t), "rest must stay quiet: {dark:?} {vision:?}");
+            let (hover, action) = paint(&ctx, &item, &mut state, vec![egui::Event::PointerMoved(close.center())]);
+            assert!(action.is_none(), "hover cannot clear the item");
+            assert!(has_hover_fill(&hover, close, t), "close must expose its token hover target: {dark:?} {vision:?}");
+            assert_eq!(hover.platform_output.cursor_icon, egui::CursorIcon::PointingHand);
+            paint(&ctx, &item, &mut state, crate::test_support::pointer(close.center(), true));
+            let (_, clicked) = paint(&ctx, &item, &mut state, crate::test_support::pointer(close.center(), false));
+            assert_eq!(clicked, Some(StatusAction::Clear(item.id.clone())));
+            let (_, keyboard) = paint(&ctx, &item, &mut state, crate::test_support::key(egui::Key::Space));
+            assert_eq!(keyboard, Some(StatusAction::Clear(item.id.clone())), "hover decoration must preserve native Space activation");
+        }
+    }
+    crate::theme::set_dark(previous.0);
+    crate::theme::set_vision(previous.1);
+}
+
 fn draw(ctx: &egui::Context, paint: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
     let mut output = ctx.run_ui(egui::RawInput::default(), paint);
     output.textures_delta.clear();
@@ -739,4 +930,205 @@ fn corner_toasts_share_one_width_against_the_right_edge() {
         }
     }
     ToastPlace::Corner.publish(&ctx);
+}
+
+/// A pane at the right edge (an edge-docked dialog, the Assistant) takes the corner column's
+/// width with it: the stack moves, at full `TOAST_WIDTH`, to just left of the pane instead of
+/// being squeezed into the strip beside it (#8804, as the frame-rate readout does, #6755).
+#[test]
+fn corner_toasts_move_left_of_a_pane_at_the_right_edge_at_full_width() {
+    let t = Tokens::get();
+    let view = Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0));
+    let axis = Rect::from_min_max(pos2(1600.0 - 8.0 - 110.0, 8.0), pos2(1592.0, 118.0));
+    let alone = corner_free(view, &[axis]);
+    assert!((alone.right() - (view.right() - t.space_8)).abs() < 0.01, "no pane keeps the corner: {alone:?}");
+    for width in [230.0, 280.0, 480.0, 760.0] {
+        let pane = Rect::from_min_max(pos2(1600.0 - 8.0 - width, 40.0), pos2(1592.0, 990.0));
+        let free = corner_free(view, &[axis, pane]);
+        assert!(free.width() >= TOAST_WIDTH - 0.5, "{width}: squeezed to {free:?}");
+        assert!(!free.intersects(pane), "{width}: {free:?} over {pane:?}");
+        assert!(free.right() <= pane.left() - t.space_8 + 0.01, "{width}: {free:?} not left of {pane:?}");
+        assert!(view.contains_rect(free), "{width}: {free:?} outside the view");
+    }
+    // Nothing is wide enough: a tall place left of the pane beats a full-width strip a line high.
+    let small = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0));
+    let axis = Rect::from_min_max(pos2(1000.0 - 8.0 - 110.0, 8.0), pos2(992.0, 118.0));
+    let pane = Rect::from_min_max(pos2(1000.0 - 8.0 - 760.0, 40.0), pos2(992.0, 990.0));
+    let free = corner_free(small, &[axis, pane]);
+    assert!(free.width() > 40.0 && free.height() >= 8.0 * t.space_8, "a strip too flat to show a toast: {free:?}");
+    assert!(!free.intersects(pane), "{free:?} over {pane:?}");
+    // Hostile input never panics or loops, and gives a finite rect or nothing.
+    let nan = Rect::from_min_max(pos2(f32::NAN, 0.0), pos2(10.0, f32::NAN));
+    let inf = Rect::from_min_max(pos2(f32::NEG_INFINITY, f32::NEG_INFINITY), pos2(f32::INFINITY, f32::INFINITY));
+    let many: Vec<Rect> = (0..40).map(|i| Rect::from_min_max(pos2(i as f32 * 30.0, 0.0), pos2(i as f32 * 30.0 + 20.0, 1000.0))).collect();
+    let cases: [(Rect, Vec<Rect>); 5] = [
+        (view, vec![nan, inf]),
+        (view, vec![view]),
+        (Rect::from_min_size(Pos2::ZERO, vec2(1.0, 1.0)), vec![axis]),
+        (view, many),
+        (Rect::NOTHING, vec![axis]),
+    ];
+    for (v, obstacles) in &cases {
+        let free = corner_free(*v, obstacles);
+        assert!(!free.is_positive() || (free.is_finite() && v.contains_rect(free)), "{free:?} in {v:?}");
+    }
+}
+
+/// With a real dialog docked at the right edge, a long status toast stays `TOAST_WIDTH` wide left
+/// of it, clear of everything covered, and goes back to the corner when the dialog closes (#8804).
+#[test]
+fn corner_toast_keeps_its_width_beside_a_docked_dialog() {
+    use crate::scenario::rect_of;
+    let t = Tokens::get();
+    for mode in [LayoutMode::Floating, LayoutMode::Docked] {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.call("ui.set", json!({"layout": mode}));
+        h.call("ui.resize", json!({"width":1600,"height":1000}));
+        let text = "Calibrating your 3D mouse fixes swapped or reversed axes and sets its speed and feel.";
+        h.app.start("parts.insert");
+        h.app.status = Some((text.into(), crate::now_ms(), true));
+        h.frames(3);
+        let dialog = h.app.viewport.dialog_rect.expect("the dialog is open");
+        let layout = h.app.viewport.layout.as_ref().unwrap();
+        let content = crate::shell::content_rect(&h.app, layout.viewport);
+        let toast = rect_of("toast").expect("the toast is drawn beside the dialog");
+        assert!((toast.width() - TOAST_WIDTH).abs() < 0.5, "{mode:?}: {toast:?} beside {dialog:?}");
+        assert!(!toast.intersects(dialog), "{mode:?}: {toast:?} over {dialog:?}");
+        assert!(content.contains_rect(toast), "{mode:?}: {toast:?} outside {content:?}");
+        for covered in crate::shell::covered_rects(&h.app) {
+            assert!(!toast.intersects(covered), "{mode:?}: {toast:?} under {covered:?}");
+        }
+        h.app.dialog = None;
+        h.app.status = Some((text.into(), crate::now_ms(), true));
+        h.frames(3);
+        let layout = h.app.viewport.layout.as_ref().unwrap();
+        let content = crate::shell::content_rect(&h.app, layout.viewport);
+        let toast = rect_of("toast").expect("the toast is drawn");
+        assert!((toast.right() - (content.right() - t.space_8)).abs() < 0.5, "{mode:?}: back in the corner: {toast:?} in {content:?}");
+        assert!((toast.width() - TOAST_WIDTH).abs() < 0.5, "{mode:?}: {toast:?}");
+    }
+}
+
+/// A dashed line reaching far off screen is cut to the view before it is dashed: epaint makes a
+/// shape per dash and steps along in f32, so one a trillion points long made billions of them,
+/// or never finished. A line in view is dashed exactly as before, and a cut one keeps its
+/// dashes in phase with its start.
+#[test]
+fn a_dashed_line_far_off_screen_is_cut_to_the_view() {
+    let view = Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0));
+    let stroke = Stroke::new(1.0, Color32::WHITE);
+    let near = [pos2(100.0, 100.0), pos2(700.0, 400.0), pos2(900.0, 100.0)];
+    assert_eq!(dashed_line(&near, view, stroke, 5.0, 3.0), Shape::dashed_line(&near, stroke, 5.0, 3.0));
+    let far = dashed_line(&[pos2(100.0, 500.0), pos2(1e12, 500.0)], view, stroke, 5.0, 3.0);
+    assert!(!far.is_empty() && far.len() < 250, "{} dashes", far.len());
+    for s in &far {
+        let Shape::LineSegment { points, .. } = s else { panic!("{s:?}") };
+        let periods = (points[0].x - 100.0) / 8.0;
+        assert!((periods - periods.round()).abs() < 1e-3, "a dash starts at {points:?}, off the line's pattern");
+    }
+    let across = dashed_line(&[pos2(-1e12, 500.0), pos2(1e12, 500.0)], view, stroke, 5.0, 3.0);
+    assert!(across.len() < 250, "{} dashes", across.len());
+    assert!(across.iter().any(|s| matches!(s, Shape::LineSegment { points, .. } if (700.0..900.0).contains(&points[0].x))), "the line shows in view");
+    for missing in [[pos2(f32::NAN, 0.0), pos2(10.0, 10.0)], [pos2(f32::INFINITY, 0.0), pos2(10.0, 10.0)], [pos2(-1e9, -1e9), pos2(-1e9, 1e9)]] {
+        assert!(dashed_line(&missing, view, stroke, 5.0, 3.0).is_empty(), "{missing:?}");
+    }
+}
+
+/// Extrude with a distance of 1e9 mm drew the taper handle's dashed line a billion millimetres
+/// long into the viewport: the frame never finished and filled the memory. It now draws at once.
+#[test]
+fn a_huge_extrude_distance_draws_its_handles_at_once() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 20})).unwrap();
+    h.settle();
+    h.step(&json!({"start": "solid.extrude"})).unwrap();
+    h.step(&json!({"click": {"world": [20, 15, 20]}})).unwrap();
+    let started = std::time::Instant::now();
+    h.step(&json!({"text": "1e9"})).unwrap();
+    h.frames(4);
+    assert!(crate::scenario::handle_at("taper").is_some(), "the taper handle is drawn");
+    assert!(started.elapsed().as_secs_f64() < 10.0, "{:?}", started.elapsed());
+}
+
+fn point_overlays(app: &SolveApp) -> Vec<Shape> {
+    let ctx = egui::Context::default();
+    let proj = display_proj(app);
+    let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(proj.rect), ..Default::default() }, |ui| {
+        overlays(app, &ui.ctx().layer_painter(egui::LayerId::background()), &proj);
+    });
+    output.textures_delta.clear();
+    output.shapes.into_iter().map(|shape| shape.shape).collect()
+}
+
+fn point_selection_rings(shapes: &[Shape]) -> Vec<Pos2> {
+    shapes
+        .iter()
+        .filter_map(|shape| match shape {
+            Shape::Circle(circle)
+                if circle.radius == 6.0 && circle.stroke == Stroke::new(2.0, Tokens::get().sel_edge) && circle.fill == Color32::TRANSPARENT =>
+            {
+                Some(circle.center)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn selected_sketch_points_stay_marked_after_hover_and_in_dialogs() {
+    let mut h = Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[10,10],[30,10]]})).unwrap();
+    h.call("ui.view", json!({"view":"top"}));
+    h.settle();
+    let plain = point_overlays(&h.app);
+    assert!(point_selection_rings(&plain).is_empty());
+    h.step(&json!({"click":{"sketch":[10,10]}})).unwrap();
+    h.step(&json!({"click":{"sketch":[30,10]},"shift":true})).unwrap();
+    h.step(&json!({"move":[5,5]})).unwrap();
+    assert!(h.app.viewport.hover.is_none());
+    assert_eq!(h.app.session.selection.iter().filter(|sel| matches!(sel, Sel::SketchPoint { .. })).count(), 2);
+    let marked = point_overlays(&h.app);
+    let proj = display_proj(&h.app);
+    let expected = [Vec3::new(10.0, 10.0, 0.0), Vec3::new(30.0, 10.0, 0.0)].map(|point| proj.to_screen(point).unwrap());
+    let rings = point_selection_rings(&marked);
+    assert_eq!(rings.len(), 2, "selection must remain visible after hover leaves");
+    assert!(expected.iter().all(|point| rings.iter().any(|ring| ring.distance(*point) < 0.01)));
+    // The markers that describe the points' constraint state keep their original fill.
+    let fills = |shapes: &[Shape]| {
+        shapes.iter().filter_map(|shape| if let Shape::Rect(rect) = shape { Some((rect.rect, rect.fill)) } else { None }).collect::<Vec<_>>()
+    };
+    assert_eq!(fills(&plain), fills(&marked));
+    h.app.start("sketch.mirror");
+    assert!(h.app.session.selection.is_empty(), "preselection transfers to the dialog");
+    assert_eq!(point_selection_rings(&point_overlays(&h.app)), rings, "dialog inputs stay highlighted");
+    h.call("ui.key", json!({"key":"Escape"}));
+    h.app.run("select.clear", json!({})).unwrap();
+    assert!(point_selection_rings(&point_overlays(&h.app)).is_empty());
+}
+
+#[test]
+fn selected_sketch_point_aliases_respect_owner_and_visibility() {
+    let mut h = Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[10,10],[30,10]]})).unwrap();
+    h.app.run("sketch.point", json!({"point":[20,20],"id":"custom:point"})).unwrap();
+    h.call("ui.view", json!({"view":"top"}));
+    h.settle();
+    let sid = h.app.session.active_sketch.unwrap();
+    let origin = h.app.session.world_state().sketch(sid).unwrap().sketch.points[0].id.clone();
+    let ids = [origin, "custom:point".into(), "l1.end".into(), format!("{sid}:l1.end"), format!("{}:l1.start", sid + 1)];
+    h.app.run("select.set", json!({"items":ids.iter().map(|id| json!({"type":"sketch_point","id":id})).collect::<Vec<_>>()})).unwrap();
+    let rings = point_selection_rings(&point_overlays(&h.app));
+    let proj = display_proj(&h.app);
+    let expected = [Vec3::ZERO, Vec3::new(20.0, 20.0, 0.0), Vec3::new(30.0, 10.0, 0.0)].map(|point| proj.to_screen(point).unwrap());
+    assert_eq!(rings.len(), 3, "aliases deduplicate, colon-containing local IDs survive, foreign owners are ignored");
+    assert!(expected.iter().all(|point| rings.iter().any(|ring| ring.distance(*point) < 0.01)));
+    h.app.run("sketch.options", json!({"show_points":false})).unwrap();
+    assert_eq!(
+        point_selection_rings(&point_overlays(&h.app)),
+        vec![expected[0]],
+        "selection does not reveal hidden points; the origin stays visible"
+    );
 }

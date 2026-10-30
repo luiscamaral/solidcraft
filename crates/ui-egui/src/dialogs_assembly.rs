@@ -83,6 +83,7 @@ const MOVES: &[&str] = &[
     "joint.rack_pinion",
     "joint.screw",
     "joint.cam",
+    "occurrence.align",
     "parts.insert",
     "parts.fastener",
 ];
@@ -559,7 +560,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Asm, inputs: &mut [Se
             // Picks that make no joint say why, under them, and offer the way out (#1239).
             if let Some((why, bodies)) = problem {
                 ui.vertical(|ui| {
-                    ui.add(egui::Label::new(RichText::new(why).color(t.warning)).wrap());
+                    crate::ui_kit::status_line(ui, &why, crate::ui_kit::StatusTone::Warning);
                     if !bodies.is_empty()
                         && crate::ui_kit::button(ui, crate::i18n::tr("cmd.component_from_bodies"), crate::ui_kit::Button::Normal)
                             .on_hover_text(crate::i18n::tr("joint.from_bodies_hint"))
@@ -634,7 +635,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Asm, inputs: &mut [Se
                 let mut edit = false;
                 ui.vertical(|ui| {
                     let why = crate::i18n::format("drive.rigid", &[("joint", name.as_str())]);
-                    ui.add(egui::Label::new(RichText::new(why).color(t.warning)).wrap());
+                    crate::ui_kit::status_line(ui, &why, crate::ui_kit::StatusTone::Warning);
                     let r = crate::ui_kit::button(ui, crate::i18n::tr_label("Edit Joint"), crate::ui_kit::Button::Normal);
                     crate::scenario::publish_handle("drive:edit_joint", r.rect.center());
                     edit = r.clicked();
@@ -742,9 +743,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Asm, inputs: &mut [Se
             let s = &app.session;
             let joints = &s.doc.assembly.joints;
             if joints.len() < 2 {
-                form_row(ui, "", |ui| {
-                    ui.label(RichText::new(crate::i18n::tr_label("needs two joints")).color(t.text_dim));
-                });
+                crate::ui_kit::status_line(ui, "needs two joints", crate::ui_kit::StatusTone::Dim);
                 return false;
             }
             let labels: Vec<&str> = joints.iter().map(|j| j.name.as_str()).collect();
@@ -831,9 +830,7 @@ fn interference(app: &mut SolveApp, picked: &[Sel], clearance: &str) -> (Value, 
 fn interference_rows(app: &SolveApp, ui: &mut egui::Ui, r: &Value) {
     let t = Tokens::get();
     if let Some(e) = r.get("error").and_then(Value::as_str) {
-        form_row(ui, "", |ui| {
-            ui.label(RichText::new(e).color(t.error));
-        });
+        crate::ui_kit::status_line(ui, e, crate::ui_kit::StatusTone::Error);
         return;
     }
     let hits = r["overlaps"].as_array().cloned().unwrap_or_default();
@@ -844,9 +841,7 @@ fn interference_rows(app: &SolveApp, ui: &mut egui::Ui, r: &Value) {
     let near = r["near"].as_array().cloned().unwrap_or_default();
     let pair = |h: &Value| format!("{} · {}", h["a"].as_str().unwrap_or(""), h["b"].as_str().unwrap_or(""));
     if hits.is_empty() && unchecked.is_empty() {
-        form_row(ui, "Result", |ui| {
-            ui.label(RichText::new(crate::i18n::tr_label("no interference")).color(t.text_dim));
-        });
+        crate::ui_kit::status_line(ui, "no interference", crate::ui_kit::StatusTone::Dim);
     }
     // Pairs closer than the clearance, nearest first.
     if !near.is_empty() {
@@ -1288,12 +1283,31 @@ fn joint_menu(
     }
 }
 
+/// Membership is indexed once so a collapsed folder with hundreds of joints stays cheap.
+fn timeline_joint_items(app: &SolveApp, ids: Option<&[u64]>) -> Vec<(u64, String, JointKind, bool)> {
+    let members: std::collections::BTreeSet<u64> = match ids {
+        Some(ids) => ids.iter().copied().collect(),
+        None => app.session.doc.timeline_groups.iter().flat_map(|group| group.joints.iter().copied()).collect(),
+    };
+    app.session
+        .doc
+        .assembly
+        .joints
+        .iter()
+        .filter(|joint| members.contains(&joint.id) == ids.is_some())
+        .map(|joint| (joint.id, joint.name.clone(), joint.kind, joint.suppressed))
+        .collect()
+}
+
 /// Joints after the features in the timeline: double-click edits, the menu drives, suppresses
 /// or deletes. Returns the x after them.
-pub fn timeline_joints(app: &mut SolveApp, ui: &mut egui::Ui, p: &egui::Painter, mut x: f32, r: egui::Rect) -> f32 {
+pub fn timeline_joints(app: &mut SolveApp, ui: &mut egui::Ui, p: &egui::Painter, x: f32, r: egui::Rect) -> f32 {
+    timeline_joint_tiles(app, ui, p, x, r, None)
+}
+
+pub(crate) fn timeline_joint_tiles(app: &mut SolveApp, ui: &mut egui::Ui, p: &egui::Painter, mut x: f32, r: egui::Rect, ids: Option<&[u64]>) -> f32 {
     let t = Tokens::get();
-    let joints: Vec<(u64, String, JointKind, bool)> =
-        app.session.doc.assembly.joints.iter().map(|j| (j.id, j.name.clone(), j.kind, j.suppressed)).collect();
+    let joints = timeline_joint_items(app, ids);
     if joints.is_empty() {
         return x;
     }
@@ -1344,14 +1358,19 @@ pub fn timeline_joints(app: &mut SolveApp, ui: &mut egui::Ui, p: &egui::Painter,
 
 /// Named joint rows for the vertical feature-history layout.
 pub fn timeline_joints_vertical(app: &mut SolveApp, ui: &mut egui::Ui) {
+    timeline_joint_rows(app, ui, None);
+}
+
+pub(crate) fn timeline_joint_rows(app: &mut SolveApp, ui: &mut egui::Ui, ids: Option<&[u64]>) {
     let t = Tokens::get();
-    let joints: Vec<(u64, String, JointKind, bool)> =
-        app.session.doc.assembly.joints.iter().map(|joint| (joint.id, joint.name.clone(), joint.kind, joint.suppressed)).collect();
+    let joints = timeline_joint_items(app, ids);
     if joints.is_empty() {
         return;
     }
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new("JOINTS").size(crate::theme::Tokens::get().font_micro).semibold().color(t.text_dim));
+    if ids.is_none() {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("JOINTS").size(crate::theme::Tokens::get().font_micro).semibold().color(t.text_dim));
+    }
     let mut open = None;
     let mut run = None;
     for (id, name, kind, suppressed) in joints {
